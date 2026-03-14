@@ -1,0 +1,19 @@
+buildscript {
+    ext {
+        compileSdkVersion = 36
+        minSdkVersion = 24
+        targetSdkVersion = 36
+        kotlinVersion = "2.2.10"
+        ndkVersion = findProperty("android.ndkVersion") ?: "27.1.12297006"    }
+
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.2.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+    }
+}
