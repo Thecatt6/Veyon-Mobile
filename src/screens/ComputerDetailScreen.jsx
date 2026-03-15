@@ -1,47 +1,46 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { View, StyleSheet, Alert, Dimensions, ScrollView, Image } from 'react-native';
-import { Text, useTheme, Appbar, Button, ActivityIndicator, Divider, Chip, Dialog, Portal, TextInput } from 'react-native-paper';
+import { Text, useTheme, Appbar, Button, ActivityIndicator, Chip, Dialog, Portal, TextInput } from 'react-native-paper';
+import { Canvas, Image as SkiaImage } from '@shopify/react-native-skia';
 import { authenticate, getSessionUser, getFeatures, setFeature } from '../controllers/VeyonAPI';
-import { getAuthKeys } from '../controllers/StorageController';
+import { getAuthKeys, getSettings } from '../controllers/StorageController';
 import { startFramePoller } from '../controllers/MJPEGStream';
+import NativeSurfaceView from '../components/NativeSurfaceView';
+import VeyonVncView from '../components/VeyonVncView';
 
 // ─── Feature metadata ──────────────────────────────────────────────────────────
-// toggle: true  → ha stato on/off, il pulsante è filled quando attivo
-// inputKey: richiede un dialogo di input prima di eseguire
-// confirm: richiede conferma per azioni distruttive
-// notSupported: funzione non supportabile via WebAPI (mostra avviso)
 const FEATURE_META = {
-  'ScreenLock':                 { label: '🔒 Lock Screen',           toggle: true },
-  'InputDevicesLock':           { label: '⌨️ Lock Input',             toggle: true },
-  'RemoteView':                 { label: '👁️ Remote View',            toggle: true },
-  'RemoteControl':              { label: '🖱️ Remote Control',         toggle: true },
-  'FullScreenDemo':             { label: '📺 Demo (Fullscreen)',       toggle: true },
-  'WindowDemo':                 { label: '🪟 Demo (Window)',           toggle: true },
-  'ShareOwnScreenFullScreen':   { label: '🖥️ Share My Screen (Full)', toggle: true },
-  'ShareOwnScreenWindow':       { label: '🖥️ Share My Screen (Win)',  toggle: true },
-  'ShareUserScreenFullScreen':  { label: '👁️ User Screen (Full)',     toggle: true },
-  'ShareUserScreenWindow':      { label: '👁️ User Screen (Win)',      toggle: true },
-  'MonitoringMode':             { label: '📡 Monitoring Mode',        toggle: true },
-  'ClipboardExchange':          { label: '📋 Clipboard Sync',         toggle: true },
+  'ScreenLock':                 { label: '🔒 Lock Screen',            toggle: true },
+  'InputDevicesLock':           { label: '⌨️ Lock Input',              toggle: true },
+  'RemoteView':                 { label: '👁️ Remote View',             toggle: true },
+  'RemoteControl':              { label: '🖱️ Remote Control',          toggle: true },
+  'FullScreenDemo':             { label: '📺 Demo (Fullscreen)',        toggle: true },
+  'WindowDemo':                 { label: '🪟 Demo (Window)',            toggle: true },
+  'ShareOwnScreenFullScreen':   { label: '🖥️ Share My Screen (Full)',  toggle: true },
+  'ShareOwnScreenWindow':       { label: '🖥️ Share My Screen (Win)',   toggle: true },
+  'ShareUserScreenFullScreen':  { label: '👁️ User Screen (Full)',      toggle: true },
+  'ShareUserScreenWindow':      { label: '👁️ User Screen (Win)',       toggle: true },
+  'MonitoringMode':             { label: '📡 Monitoring Mode',         toggle: true },
+  'ClipboardExchange':          { label: '📋 Clipboard Sync',          toggle: true },
+  'DemoServer':                 { label: '📺 Demo Server',             toggle: true },
+  'SystemTrayIcon':             { label: '🔔 Tray Icon',               toggle: true },
   'Screenshot':                 { label: '📸 Screenshot' },
   'UserLogin':                  { label: '🔑 Login' },
-  'UserLogoff':                 { label: '🚪 Logoff',                 confirm: true },
+  'UserLogoff':                 { label: '🚪 Logoff',                  confirm: true },
   'PowerOn':                    { label: '⚡ Power On' },
-  'Reboot':                     { label: '🔄 Reboot',                 confirm: true },
-  'RebootNow':                  { label: '🔄 Reboot Now',             confirm: true },
-  'PowerDown':                  { label: '⏻ Shutdown',                confirm: true },
-  'PowerDownNow':               { label: '⏻ Shutdown Now',            confirm: true },
-  'InstallUpdatesAndPowerDown': { label: '🔄 Update & Shutdown',      confirm: true },
-  'PowerDownConfirmed':         { label: '⏻ Shutdown (Confirmed)',    confirm: true },
-  'PowerDownDelayed':           { label: '⏻ Shutdown (Delayed)',      confirm: true },
-  'TextMessage':                { label: '💬 Send Message',           inputKey: 'text' },
-  'OpenWebsite':                { label: '🌐 Open Website',           inputKey: 'url' },
-  'StartApp':                   { label: '▶️ Start App',              inputKey: 'app' },
-  'DistributeFiles':            { label: '📤 Distribute Files',       notSupported: 'File distribution requires Veyon Master.' },
-  'FileCollect':                { label: '📥 Collect Files',          notSupported: 'File collection requires Veyon Master.' },
-  'DemoServer':                 { label: '📺 Demo Server',            toggle: true },
+  'Reboot':                     { label: '🔄 Reboot',                  confirm: true },
+  'RebootNow':                  { label: '🔄 Reboot Now',              confirm: true },
+  'PowerDown':                  { label: '⏻ Shutdown',                 confirm: true },
+  'PowerDownNow':               { label: '⏻ Shutdown Now',             confirm: true },
+  'InstallUpdatesAndPowerDown': { label: '🔄 Update & Shutdown',       confirm: true },
+  'PowerDownConfirmed':         { label: '⏻ Shutdown (Confirmed)',     confirm: true },
+  'PowerDownDelayed':           { label: '⏻ Shutdown (Delayed)',       confirm: true },
+  'TextMessage':                { label: '💬 Send Message',            inputKey: 'text' },
+  'OpenWebsite':                { label: '🌐 Open Website',            inputKey: 'url' },
+  'StartApp':                   { label: '▶️ Start App',               inputKey: 'app' },
+  'DistributeFiles':            { label: '📤 Distribute Files',        notSupported: 'Requires Veyon Master.' },
+  'FileCollect':                { label: '📥 Collect Files',           notSupported: 'Requires Veyon Master.' },
   'Demo':                       { label: '📺 Demo' },
-  'SystemTrayIcon':             { label: '🔔 Tray Icon',              toggle: true },
   'QueryApplicationVersion':    { label: 'ℹ️ App Version' },
   'QueryActiveFeatures':        { label: '🔍 Active Features' },
   'UserInfo':                   { label: '👤 User Info' },
@@ -52,16 +51,17 @@ const FEATURE_META = {
   'AccessControlProvider':      { label: '🔐 Access Control' },
 };
 
+const INPUT_CONFIG = {
+  text: { title: '💬 Message to send',  placeholder: 'Type your message…', multiline: true },
+  url:  { title: '🌐 Website URL',       placeholder: 'https://example.com',multiline: false },
+  app:  { title: '▶️ App to start',      placeholder: 'notepad.exe',        multiline: false },
+};
+
 function getMeta(feature) {
   return FEATURE_META[feature.name] || { label: feature.name || feature.uid.slice(0, 8) };
 }
 
-// ─── Input dialog config ──────────────────────────────────────────────────────
-const INPUT_CONFIG = {
-  text: { title: '💬 Message to send',   placeholder: 'Type your message…',  multiline: true },
-  url:  { title: '🌐 Website URL',        placeholder: 'https://example.com', multiline: false },
-  app:  { title: '▶️ App to start',       placeholder: 'notepad.exe',         multiline: false },
-};
+const RENDERER_LABELS = { image: '🖼️ Image', skia: '⚡ Skia', native: '🚀 Native' };
 
 // ─── Component ────────────────────────────────────────────────────────────────
 const ComputerDetailScreen = ({ route, navigation }) => {
@@ -70,26 +70,46 @@ const ComputerDetailScreen = ({ route, navigation }) => {
 
   const [status, setStatus] = useState('connecting');
   const [userLabel, setUserLabel] = useState('');
-  const [frameSource, setFrameSource] = useState(null);
   const [fps, setFps] = useState(0);
   const [features, setFeatures] = useState([]);
   const [loadingFeature, setLoadingFeature] = useState(null);
   const [actionsVisible, setActionsVisible] = useState(false);
-  const [inputDialog, setInputDialog] = useState(null); // { feature, inputKey }
+  const [inputDialog, setInputDialog] = useState(null);
   const [inputValue, setInputValue] = useState('');
 
-  const lastFrameTimeRef = useRef(0);
-  const FRAME_INTERVAL = 100; // ms → max 10 FPS on UI thread
+  // ── Renderer state ───────────────────────────────────────────────────────────
+  const [renderer, setRenderer] = useState('skia');
+  const [frameQuality, setFrameQuality] = useState(50);
+  const [frameCompression, setFrameCompression] = useState(6);
+  const [vncPort, setVncPort] = useState(11100);
+
+  // Frame state for each renderer
+  const [imageFrame, setImageFrame] = useState(null);   // base64 URI
+  const [skiaFrame, setSkiaFrame] = useState(null);     // SkiaImage object
+  const [nativeFrame, setNativeFrame] = useState(null); // base64 URI for NativeSurfaceView
+
+  const sessionRef = useRef(null);
   const mountedRef = useRef(true);
   const cancelStreamRef = useRef(null);
   const fpsCountRef = useRef(0);
   const fpsTimerRef = useRef(null);
+  const lastFrameTimeRef = useRef(0);
+  const FRAME_INTERVAL = 80; // ~12 FPS UI throttle
 
   const baseURL = `http://${computer.ip}:${computer.port}`;
-  const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
-  const frameHeight = Math.round(screenHeight * 0.6);
+  const { width: W, height: H } = Dimensions.get('window');
+  const frameHeight = Math.round(H * 0.6);
 
-  // ── FPS ──────────────────────────────────────────────────────────────────
+  // ── Load settings on mount ────────────────────────────────────────────────
+  useEffect(() => {
+    getSettings().then((s) => {
+      setRenderer(s.renderer || 'skia');
+      setFrameQuality(s.frameQuality || 50);
+      setFrameCompression(s.frameCompression || 6);
+    });
+  }, []);
+
+  // ── FPS counter ───────────────────────────────────────────────────────────
   const startFPSCounter = useCallback(() => {
     fpsTimerRef.current = setInterval(() => {
       if (mountedRef.current) { setFps(fpsCountRef.current); fpsCountRef.current = 0; }
@@ -114,47 +134,77 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   const loadFeatures = useCallback(async (uid, retries = 3) => {
     const targetUid = uid || sessionRef.current?.connectionUid;
     if (!targetUid) return;
-    for (let attempt = 1; attempt <= retries; attempt++) {
+    for (let i = 1; i <= retries; i++) {
       try {
         const data = await getFeatures(baseURL, targetUid);
         const list = Array.isArray(data) ? data
           : Array.isArray(data?.features) ? data.features
           : Array.isArray(data?.data) ? data.data : [];
-        if (list.length > 0) {
-          if (mountedRef.current) setFeatures(list); // show ALL features
-          return;
-        }
-      } catch (err) {
-        console.log(`Features error (attempt ${attempt}):`, err?.message);
-      }
-      if (attempt < retries) await new Promise(r => setTimeout(r, 1000));
+        if (list.length > 0 && mountedRef.current) { setFeatures(list); return; }
+      } catch (e) { console.log(`Features attempt ${i}:`, e?.message); }
+      if (i < retries) await new Promise(r => setTimeout(r, 1000));
     }
   }, [baseURL]);
 
-  // ── Stream ────────────────────────────────────────────────────────────────
-  const startStream = useCallback((connectionUid) => {
+  // ── Start stream ──────────────────────────────────────────────────────────
+  const startStream = useCallback((connectionUid, rendererMode, quality, compression) => {
     cancelStreamRef.current?.();
     cancelStreamRef.current = startFramePoller(
       baseURL, connectionUid,
-      (dataURI) => {
+      (frame) => {
         if (!mountedRef.current) return;
+        // Throttle UI updates
         const now = Date.now();
         if (now - lastFrameTimeRef.current < FRAME_INTERVAL) return;
         lastFrameTimeRef.current = now;
-        setFrameSource({ uri: dataURI });
         fpsCountRef.current += 1;
+
+        if (rendererMode === 'skia' && typeof frame === 'object') {
+          setSkiaFrame(frame);
+        } else if (rendererMode === 'native') {
+          setNativeFrame(frame);
+        } else {
+          setImageFrame({ uri: frame });
+        }
       },
       (err) => console.warn('Frame error:', err),
       reAuth,
-      { quality: 50, compression: 8 },
+      { quality, compression, rendererMode },
     );
   }, [baseURL, reAuth]);
 
   // ── Init ──────────────────────────────────────────────────────────────────
   const initialize = useCallback(async () => {
-    const keys = await getAuthKeys();
+    const [keys, settings] = await Promise.all([getAuthKeys(), getSettings()]);
     const keyList = Object.values(keys);
+    const r = settings.renderer || 'skia';
+    const q = settings.frameQuality || 50;
+    const c = settings.frameCompression || 6;
+    const vp = settings.vncPort || 11100;
+    setRenderer(r); setFrameQuality(q); setFrameCompression(c); setVncPort(vp);
+
     if (keyList.length === 0) { setStatus('no-auth'); return; }
+
+    // VNC mode: just authenticate to get session info, skip HTTP stream
+    if (r === 'vnc') {
+      for (const key of keyList) {
+        try {
+          const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
+          if (!mountedRef.current) return;
+          sessionRef.current = session;
+          try {
+            const user = await getSessionUser(baseURL, session.connectionUid);
+            if (mountedRef.current) setUserLabel(user || '');
+          } catch { /* non-blocking */ }
+          if (mountedRef.current) setStatus('live');
+          setTimeout(() => loadFeatures(session.connectionUid), 800);
+          return;
+        } catch (e) { console.log('Auth error:', e?.message); }
+      }
+      if (mountedRef.current) setStatus('error');
+      return;
+    }
+
     for (const key of keyList) {
       try {
         const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
@@ -164,11 +214,11 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           const user = await getSessionUser(baseURL, session.connectionUid);
           if (mountedRef.current) setUserLabel(user || '');
         } catch { /* non-blocking */ }
-        startStream(session.connectionUid);
+        startStream(session.connectionUid, r, q, c);
         if (mountedRef.current) setStatus('live');
         setTimeout(() => loadFeatures(session.connectionUid), 800);
         return;
-      } catch (err) { console.log('Auth error:', err?.message); }
+      } catch (e) { console.log('Auth error:', e?.message); }
     }
     if (mountedRef.current) setStatus('error');
   }, [computer, baseURL, loadFeatures, startStream]);
@@ -184,89 +234,95 @@ const ComputerDetailScreen = ({ route, navigation }) => {
     };
   }, []);
 
-  // ── Execute feature ────────────────────────────────────────────────────────
+  // ── Feature execution ─────────────────────────────────────────────────────
   const executeFeature = useCallback(async (feature, args = {}) => {
     if (!sessionRef.current) return;
     const meta = getMeta(feature);
     const newActive = meta.toggle ? !feature.active : true;
-
-    // Optimistic UI update for toggles — don't wait for reload
     if (meta.toggle) {
-      setFeatures(prev => prev.map(f =>
-        f.uid === feature.uid ? { ...f, active: newActive } : f
-      ));
+      setFeatures(prev => prev.map(f => f.uid === feature.uid ? { ...f, active: newActive } : f));
     }
-
     setLoadingFeature(feature.uid);
     try {
       await setFeature(baseURL, sessionRef.current.connectionUid, feature.uid, newActive, args);
-      // Reload to get actual state from server
       await loadFeatures(sessionRef.current.connectionUid, 1);
     } catch (err) {
-      // Revert optimistic update on error
       if (meta.toggle) {
-        setFeatures(prev => prev.map(f =>
-          f.uid === feature.uid ? { ...f, active: feature.active } : f
-        ));
+        setFeatures(prev => prev.map(f => f.uid === feature.uid ? { ...f, active: feature.active } : f));
       }
       Alert.alert('Error', err?.response?.data?.error?.message || err?.message || 'Unknown error');
-    } finally {
-      setLoadingFeature(null);
-    }
+    } finally { setLoadingFeature(null); }
   }, [baseURL, loadFeatures]);
 
-  // ── Handle feature press ───────────────────────────────────────────────────
   const handleFeaturePress = useCallback((feature) => {
     const meta = getMeta(feature);
-
-    if (meta.notSupported) {
-      Alert.alert('Not supported via API', meta.notSupported);
-      return;
-    }
-
-    if (meta.inputKey) {
-      setInputValue('');
-      setInputDialog({ feature, inputKey: meta.inputKey });
-      return;
-    }
-
+    if (meta.notSupported) { Alert.alert('Not supported', meta.notSupported); return; }
+    if (meta.inputKey) { setInputValue(''); setInputDialog({ feature, inputKey: meta.inputKey }); return; }
     if (meta.confirm) {
-      Alert.alert(
-        meta.label,
-        `Send "${meta.label}" to ${computer.label || computer.ip}?`,
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Confirm', style: 'destructive', onPress: () => executeFeature(feature) },
-        ]
-      );
+      Alert.alert(meta.label, `Send "${meta.label}" to ${computer.label || computer.ip}?`, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Confirm', style: 'destructive', onPress: () => executeFeature(feature) },
+      ]);
       return;
     }
-
     executeFeature(feature);
   }, [computer, executeFeature]);
 
-  // ── Confirm input dialog ───────────────────────────────────────────────────
   const handleInputConfirm = useCallback(() => {
     if (!inputDialog || !inputValue.trim()) return;
     const { feature, inputKey } = inputDialog;
-
-    // Build arguments according to Veyon WebAPI spec
     let args = {};
-    if (inputKey === 'text') {
-      args = { text: inputValue.trim() };
-    } else if (inputKey === 'url') {
+    if (inputKey === 'text') args = { text: inputValue.trim() };
+    else if (inputKey === 'url') {
       let url = inputValue.trim();
-      if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'https://' + url;
+      if (!url.startsWith('http')) url = 'https://' + url;
       args = { url };
-    } else if (inputKey === 'app') {
-      args = { executable: inputValue.trim() };
-    }
-
+    } else if (inputKey === 'app') args = { executable: inputValue.trim() };
     setInputDialog(null);
     executeFeature(feature, args);
   }, [inputDialog, inputValue, executeFeature]);
 
   const s = styles(theme);
+  const hasFrame = imageFrame || skiaFrame || nativeFrame || renderer === 'vnc';
+
+  // ── Render framebuffer based on renderer setting ────────────────────────────
+  const renderFrame = () => {
+    if (renderer === 'vnc') {
+      const authBody = sessionRef.current?.authBody;
+      return (
+        <VeyonVncView
+          host={computer.ip}
+          port={vncPort}
+          keyName={authBody?.credentials?.keyname || ''}
+          privateKey={authBody?.credentials?.keydata || ''}
+          style={{ width: W, height: frameHeight }}
+          onConnected={() => setStatus('live')}
+          onError={(e) => console.warn('VNC error:', e)}
+        />
+      );
+    }
+    if (renderer === 'skia' && skiaFrame) {
+      return (
+        <Canvas style={{ width: W, height: frameHeight }}>
+          <SkiaImage image={skiaFrame} x={0} y={0} width={W} height={frameHeight} fit="contain" />
+        </Canvas>
+      );
+    }
+    if (renderer === 'native' && nativeFrame) {
+      return (
+        <NativeSurfaceView
+          frameBase64={nativeFrame}
+          style={{ width: W, height: frameHeight }}
+        />
+      );
+    }
+    if (imageFrame) {
+      return (
+        <Image source={imageFrame} style={{ width: W, height: frameHeight }} resizeMode="contain" fadeDuration={0} />
+      );
+    }
+    return null;
+  };
 
   return (
     <View style={s.container}>
@@ -279,29 +335,18 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           subtitleStyle={s.appbarSubtitle}
         />
         {status === 'live' && (
-          <Chip compact style={s.fpsBadge} textStyle={s.fpsBadgeText}>{fps} FPS</Chip>
+          <Chip compact style={s.fpsBadge} textStyle={s.fpsBadgeText}>
+            {fps} FPS · {RENDERER_LABELS[renderer]}
+          </Chip>
         )}
         {features.length > 0 && (
-          <Appbar.Action
-            icon="lightning-bolt"
-            iconColor={theme.colors.primary}
-            onPress={() => setActionsVisible(true)}
-          />
-        )}
-        {status === 'live' && features.length === 0 && (
-          <Appbar.Action
-            icon="loading"
-            iconColor={theme.colors.onSurfaceVariant}
-            onPress={() => loadFeatures()}
-          />
+          <Appbar.Action icon="lightning-bolt" iconColor={theme.colors.primary} onPress={() => setActionsVisible(true)} />
         )}
       </Appbar.Header>
 
       {/* Framebuffer */}
       <View style={[s.frameContainer, { height: frameHeight }]}>
-        {frameSource ? (
-          <Image source={frameSource} style={s.frame} resizeMode="cover" fadeDuration={0} />
-        ) : (
+        {hasFrame ? renderFrame() : (
           <View style={s.framePlaceholder}>
             {status === 'connecting' || status === 'live' ? (
               <>
@@ -319,15 +364,9 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         )}
       </View>
 
-      <Divider style={{ backgroundColor: theme.colors.outline }} />
-
       <Portal>
         {/* Actions dialog */}
-        <Dialog
-          visible={actionsVisible}
-          onDismiss={() => setActionsVisible(false)}
-          style={{ backgroundColor: theme.colors.surface }}
-        >
+        <Dialog visible={actionsVisible} onDismiss={() => setActionsVisible(false)} style={{ backgroundColor: theme.colors.surface }}>
           <Dialog.Title style={{ color: theme.colors.onSurface }}>
             Actions — {computer.label || computer.ip}
           </Dialog.Title>
@@ -341,14 +380,11 @@ const ComputerDetailScreen = ({ route, navigation }) => {
                     <Button
                       key={feature.uid}
                       mode={isActive ? 'contained' : 'outlined'}
-                      style={[s.actionButton, meta.notSupported && s.actionDisabled]}
+                      style={[s.actionButton, meta.notSupported && { opacity: 0.5 }]}
                       labelStyle={s.actionLabel}
                       loading={loadingFeature === feature.uid}
                       disabled={loadingFeature !== null}
-                      onPress={() => {
-                        setActionsVisible(false);
-                        setTimeout(() => handleFeaturePress(feature), 150);
-                      }}
+                      onPress={() => { setActionsVisible(false); setTimeout(() => handleFeaturePress(feature), 150); }}
                       compact
                     >
                       {meta.label}
@@ -364,11 +400,7 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         </Dialog>
 
         {/* Input dialog */}
-        <Dialog
-          visible={inputDialog !== null}
-          onDismiss={() => setInputDialog(null)}
-          style={{ backgroundColor: theme.colors.surface }}
-        >
+        <Dialog visible={inputDialog !== null} onDismiss={() => setInputDialog(null)} style={{ backgroundColor: theme.colors.surface }}>
           <Dialog.Title style={{ color: theme.colors.onSurface }}>
             {inputDialog ? INPUT_CONFIG[inputDialog.inputKey].title : ''}
           </Dialog.Title>
@@ -386,13 +418,7 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={() => setInputDialog(null)}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={handleInputConfirm}
-              disabled={!inputValue.trim()}
-            >
-              Send
-            </Button>
+            <Button mode="contained" onPress={handleInputConfirm} disabled={!inputValue.trim()}>Send</Button>
           </Dialog.Actions>
         </Dialog>
       </Portal>
@@ -406,14 +432,12 @@ const styles = (theme) => StyleSheet.create({
   appbarTitle: { fontSize: 16, fontWeight: '700', color: theme.colors.onSurface },
   appbarSubtitle: { fontSize: 12, color: theme.colors.onSurfaceVariant },
   fpsBadge: { backgroundColor: theme.colors.surfaceVariant, marginRight: 4 },
-  fpsBadgeText: { fontSize: 11, color: theme.colors.secondary, fontWeight: '700' },
+  fpsBadgeText: { fontSize: 10, color: theme.colors.secondary, fontWeight: '700' },
   frameContainer: { width: '100%', backgroundColor: '#000' },
-  frame: { width: '100%', height: '100%' },
   framePlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
   placeholderText: { color: theme.colors.onSurfaceVariant, fontSize: 13, textAlign: 'center' },
   actionsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   actionButton: { marginBottom: 4 },
-  actionDisabled: { opacity: 0.5 },
   actionLabel: { fontSize: 12 },
 });
 

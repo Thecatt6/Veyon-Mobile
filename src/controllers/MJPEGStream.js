@@ -1,73 +1,102 @@
 import ReactNativeBlobUtil from 'react-native-blob-util';
 
 /**
- * Poller ottimizzato per Veyon (Endpoint: /api/v1/framebuffer)
+ * Unified FramePoller per Veyon.
+ * Supporta 3 modalità di output:
+ *   - 'image':  callback con data URI base64 (per React Native Image)
+ *   - 'skia':   callback con SkiaImage (per @shopify/react-native-skia)
+ *   - 'native': callback con data URI base64 (per NativeSurfaceView)
  */
-export function startFramePoller(baseURL, initialConnectionUid, onFrame, onError, reAuthFn, options = {}) {
+export function startFramePoller(
+  baseURL,
+  initialConnectionUid,
+  onFrame,
+  onError,
+  reAuthFn,
+  options = {}
+) {
   const {
     quality = 50,
-    compression = 8,
-    delay503 = 800,   // ms di attesa su 503 (server occupato)
-    delayFrame = 0,   // ms tra un frame e il prossimo (0 = massima velocità)
+    compression = 6,
+    delay503 = 500,
     delayError = 1000,
+    rendererMode = 'image', // 'image' | 'skia' | 'native'
   } = options;
 
-  let pollerCancelled = false;
+  let cancelled = false;
   let currentConnectionUid = initialConnectionUid;
   let frameCount = 0;
 
+  // Import Skia lazily solo se necessario
+  let Skia = null;
+  if (rendererMode === 'skia') {
+    try {
+      Skia = require('@shopify/react-native-skia').Skia;
+    } catch (e) {
+      console.warn('Skia not available, falling back to image mode');
+    }
+  }
+
   async function poll() {
-    while (!pollerCancelled) {
+    while (!cancelled) {
       try {
-        // Re-auth se necessario
         if (!currentConnectionUid) {
-          console.log('MJPEGStream: re-autenticazione...');
           currentConnectionUid = await reAuthFn?.();
           if (!currentConnectionUid) {
             await new Promise(r => setTimeout(r, 2000));
             continue;
           }
-          console.log('MJPEGStream: re-auth OK');
         }
 
         const url = `${baseURL}/api/v1/framebuffer?format=jpeg&compression=${compression}&quality=[${quality}]&_t=${Date.now()}`;
 
         const response = await ReactNativeBlobUtil.fetch('GET', url, {
-          'connection-uid': currentConnectionUid,  // lowercase — Veyon è case-sensitive
+          'connection-uid': currentConnectionUid,
           'Accept': 'image/jpeg',
         });
 
         const status = response.info().status;
 
         if (status === 200) {
-          const base64Str = response.base64();
-          if (!pollerCancelled && base64Str) {
-            frameCount++;
-            if (frameCount <= 3) console.log(`Frame #${frameCount} ricevuto`);
-            onFrame(`data:image/jpeg;base64,${base64Str}`);
+          frameCount++;
+          if (frameCount <= 3) console.log(`Frame #${frameCount} [${rendererMode}]`);
+
+          if (rendererMode === 'skia' && Skia) {
+            // Skia: bytes diretti → GPU, nessuna base64
+            try {
+              const data = response.arrayBuffer();
+              const bytes = new Uint8Array(data);
+              if (bytes[0] === 0xFF && bytes[1] === 0xD8) {
+                const skiaData = Skia.Data.fromBytes(bytes);
+                const image = Skia.Image.MakeFromEncoded(skiaData);
+                if (image && !cancelled) onFrame(image);
+              }
+            } catch (e) {
+              // Fallback a base64 se Skia fallisce
+              const b64 = response.base64();
+              if (b64 && !cancelled) onFrame(`data:image/jpeg;base64,${b64}`);
+            }
+          } else {
+            // Image / Native: base64
+            const b64 = response.base64();
+            if (b64 && !cancelled) onFrame(`data:image/jpeg;base64,${b64}`);
           }
-          // Piccola pausa per non saturare CPU/rete
-          if (delayFrame > 0) await new Promise(r => setTimeout(r, delayFrame));
 
         } else if (status === 503) {
-          // Server occupato — attendi e riprova silenziosamente
           await new Promise(r => setTimeout(r, delay503));
 
         } else if (status === 401 || status === 403) {
-          // Sessione scaduta — forza re-auth al prossimo ciclo
-          console.warn('MJPEGStream: sessione scaduta, re-auth al prossimo ciclo');
           currentConnectionUid = null;
           await new Promise(r => setTimeout(r, 500));
 
         } else {
-          // Errore non recuperabile — logga ma continua
-          console.warn(`MJPEGStream: HTTP ${status}`);
+          console.warn(`Framebuffer HTTP ${status}`);
           await new Promise(r => setTimeout(r, delayError));
         }
 
       } catch (err) {
-        if (!pollerCancelled) {
-          console.warn('MJPEGStream fetch error:', err?.message);
+        if (!cancelled) {
+          console.warn('Frame poll error:', err?.message);
           await new Promise(r => setTimeout(r, delayError));
         }
       }
@@ -75,6 +104,5 @@ export function startFramePoller(baseURL, initialConnectionUid, onFrame, onError
   }
 
   poll();
-
-  return () => { pollerCancelled = true; };
+  return () => { cancelled = true; };
 }

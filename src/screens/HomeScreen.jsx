@@ -218,6 +218,11 @@ const HomeScreen = ({ navigation }) => {
         <Appbar.Header style={s.appbar}>
           <Appbar.Content title="Monitoring Center" titleStyle={s.appbarTitle} />
           <Appbar.Action
+            icon="cog"
+            onPress={() => navigation.navigate('Settings')}
+            iconColor={theme.colors.onSurfaceVariant}
+          />
+          <Appbar.Action
             icon="key"
             onPress={() => navigation.navigate('KeyManager')}
             iconColor={theme.colors.onSurfaceVariant}

@@ -9,6 +9,7 @@ import AddComputerScreen from './src/screens/AddComputerScreen';
 import DiscoveryScreen from './src/screens/DiscoveryScreen';
 import KeyManagerScreen from './src/screens/KeyManagerScreen';
 import ComputerDetailScreen from './src/screens/ComputerDetailScreen';
+import SettingsScreen from './src/screens/SettingsScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -23,6 +24,7 @@ export default function App() {
           <Stack.Screen name="Discovery" component={DiscoveryScreen} />
           <Stack.Screen name="KeyManager" component={KeyManagerScreen} />
           <Stack.Screen name="ComputerDetail" component={ComputerDetailScreen} />
+          <Stack.Screen name="Settings" component={SettingsScreen} />
         </Stack.Navigator>
       </NavigationContainer>
     </PaperProvider>

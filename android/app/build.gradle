@@ -18,10 +18,10 @@ android {
     buildToolsVersion "36.0.0"
     ndkVersion rootProject.ext.ndkVersion
 
-    namespace "com.monitoringcenternew"
+    namespace "com.veyonmobile"
 
     defaultConfig {
-        applicationId "com.monitoringcenternew"
+        applicationId "com.veyonmobile"
         minSdk rootProject.ext.minSdkVersion
         targetSdk rootProject.ext.targetSdkVersion
         versionCode 1

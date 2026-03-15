@@ -3,7 +3,7 @@ import { View, FlatList, StyleSheet, Alert } from 'react-native';
 import { Text, useTheme, Appbar, Button, Divider, List, IconButton, TextInput } from 'react-native-paper';
 import { useFocusEffect } from '@react-navigation/native';
 import { pick, isCancel } from '@react-native-documents/picker';
-import { readFile, copyFile, unlink, TemporaryDirectoryPath } from '@dr.pogodin/react-native-fs';
+import { readFile } from '@dr.pogodin/react-native-fs';
 import 'react-native-get-random-values';
 import { v4 as uuidv4 } from 'uuid';
 import { getAuthKeys, saveAuthKey, deleteAuthKey } from '../controllers/StorageController';
@@ -26,14 +26,16 @@ const KeyManagerScreen = ({ navigation }) => {
       const result = results[0];
       if (!result) return;
 
+      console.log('Picker result:', JSON.stringify(result));
+      const fileUri = result.uri;
+
       let content;
       try {
-        content = await readFile(result.uri, 'utf8');
-      } catch {
-        const tmpPath = `${TemporaryDirectoryPath}/tmp_key_${Date.now()}.pem`;
-        await copyFile(result.uri, tmpPath);
-        content = await readFile(tmpPath, 'utf8');
-        await unlink(tmpPath);
+        // @dr.pogodin/react-native-fs supporta content:// URI su Android
+        content = await readFile(fileUri, 'utf8');
+      } catch (readErr) {
+        console.error('File read error:', readErr);
+        throw readErr;
       }
 
       const fileName = keyNameInput.trim() || result.name?.replace(/\.[^/.]+$/, '') || 'imported-key';

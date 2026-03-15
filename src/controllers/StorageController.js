@@ -2,6 +2,30 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const COMPUTERS_KEY = '@mc_computers';
 const KEYS_KEY = '@mc_authkeys';
+const SETTINGS_KEY = '@mc_settings';
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+const DEFAULT_SETTINGS = {
+  renderer: 'skia',   // 'image' | 'skia' | 'native' | 'vnc'
+  frameQuality: 50,
+  frameCompression: 6,
+  vncPort: 11100,
+};
+
+async function getSettings() {
+  try {
+    const raw = await AsyncStorage.getItem(SETTINGS_KEY);
+    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : DEFAULT_SETTINGS;
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
+async function saveSettings(settings) {
+  const current = await getSettings();
+  await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...current, ...settings }));
+}
 
 // ─── Computers ────────────────────────────────────────────────────────────────
 
@@ -65,3 +89,6 @@ export {
   saveAuthKey,
   deleteAuthKey,
 };
+
+// Re-export settings (already defined above)
+export { getSettings, saveSettings };
