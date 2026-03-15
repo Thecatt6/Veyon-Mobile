@@ -15,7 +15,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "13B07F861A680F5B00A75B9A"
-               BuildableName = "MonitoringCenterNew.app"
+               BuildableName = "MonitoringCenterNew
+               .app"
                BlueprintName = "MonitoringCenterNew"
                ReferencedContainer = "container:MonitoringCenterNew.xcodeproj">
             </BuildableReference>

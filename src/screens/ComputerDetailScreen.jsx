@@ -25,7 +25,7 @@ const FEATURE_META = {
   'DemoServer':                 { label: '📺 Demo Server',             toggle: true },
   'SystemTrayIcon':             { label: '🔔 Tray Icon',               toggle: true },
   'Screenshot':                 { label: '📸 Screenshot' },
-  'UserLogin':                  { label: '🔑 Login' },
+  'UserLogin':                  { label: '🔑 Login',                   inputKey: 'login' },
   'UserLogoff':                 { label: '🚪 Logoff',                  confirm: true },
   'PowerOn':                    { label: '⚡ Power On' },
   'Reboot':                     { label: '🔄 Reboot',                  confirm: true },
@@ -52,9 +52,10 @@ const FEATURE_META = {
 };
 
 const INPUT_CONFIG = {
-  text: { title: '💬 Message to send',  placeholder: 'Type your message…', multiline: true },
-  url:  { title: '🌐 Website URL',       placeholder: 'https://example.com',multiline: false },
-  app:  { title: '▶️ App to start',      placeholder: 'notepad.exe',        multiline: false },
+  text:  { title: '💬 Message to send',  placeholder: 'Type your message…', multiline: true },
+  url:   { title: '🌐 Website URL',       placeholder: 'https://example.com',multiline: false },
+  app:   { title: '▶️ App to start',      placeholder: 'notepad.exe',        multiline: false },
+  login: { title: '🔑 Login credentials', placeholder: '',                   multiline: false },
 };
 
 function getMeta(feature) {
@@ -76,6 +77,7 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   const [actionsVisible, setActionsVisible] = useState(false);
   const [inputDialog, setInputDialog] = useState(null);
   const [inputValue, setInputValue] = useState('');
+  const [inputPassword, setInputPassword] = useState('');
 
   // ── Renderer state ───────────────────────────────────────────────────────────
   const [renderer, setRenderer] = useState('skia');
@@ -236,6 +238,7 @@ const ComputerDetailScreen = ({ route, navigation }) => {
 
   // ── Feature execution ─────────────────────────────────────────────────────
   const executeFeature = useCallback(async (feature, args = {}) => {
+    console.log('Executing:', feature.name, 'args:', JSON.stringify(args));
     if (!sessionRef.current) return;
     const meta = getMeta(feature);
     const newActive = meta.toggle ? !feature.active : true;
@@ -269,18 +272,37 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   }, [computer, executeFeature]);
 
   const handleInputConfirm = useCallback(() => {
-    if (!inputDialog || !inputValue.trim()) return;
+    if (!inputDialog) return;
     const { feature, inputKey } = inputDialog;
     let args = {};
-    if (inputKey === 'text') args = { text: inputValue.trim() };
-    else if (inputKey === 'url') {
+
+    if (inputKey === 'text') {
+      if (!inputValue.trim()) return;
+      args = { text: inputValue.trim() };
+
+    } else if (inputKey === 'url') {
+      if (!inputValue.trim()) return;
       let url = inputValue.trim();
-      if (!url.startsWith('http')) url = 'https://' + url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'https://' + url;
+      // Veyon expects 'url' inside arguments
       args = { url };
-    } else if (inputKey === 'app') args = { executable: inputValue.trim() };
+
+    } else if (inputKey === 'app') {
+      if (!inputValue.trim()) return;
+      // Veyon expects 'executable' inside arguments
+      args = { executable: inputValue.trim() };
+
+    } else if (inputKey === 'login') {
+      if (!inputValue.trim()) return;
+      // Veyon UserLogin expects username and password
+      args = { username: inputValue.trim(), password: inputPassword };
+    }
+
     setInputDialog(null);
+    setInputValue('');
+    setInputPassword('');
     executeFeature(feature, args);
-  }, [inputDialog, inputValue, executeFeature]);
+  }, [inputDialog, inputValue, inputPassword, executeFeature]);
 
   const s = styles(theme);
   const hasFrame = imageFrame || skiaFrame || nativeFrame || renderer === 'vnc';
@@ -400,25 +422,54 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         </Dialog>
 
         {/* Input dialog */}
-        <Dialog visible={inputDialog !== null} onDismiss={() => setInputDialog(null)} style={{ backgroundColor: theme.colors.surface }}>
+        <Dialog visible={inputDialog !== null} onDismiss={() => { setInputDialog(null); setInputValue(''); setInputPassword(''); }} style={{ backgroundColor: theme.colors.surface }}>
           <Dialog.Title style={{ color: theme.colors.onSurface }}>
-            {inputDialog ? INPUT_CONFIG[inputDialog.inputKey].title : ''}
+            {inputDialog ? INPUT_CONFIG[inputDialog.inputKey]?.title : ''}
           </Dialog.Title>
           <Dialog.Content>
-            <TextInput
-              mode="outlined"
-              value={inputValue}
-              onChangeText={setInputValue}
-              placeholder={inputDialog ? INPUT_CONFIG[inputDialog.inputKey].placeholder : ''}
-              autoFocus
-              multiline={inputDialog ? INPUT_CONFIG[inputDialog.inputKey].multiline : false}
-              numberOfLines={inputDialog?.inputKey === 'text' ? 4 : 1}
-              style={{ backgroundColor: theme.colors.surfaceVariant }}
-            />
+            {inputDialog?.inputKey === 'login' ? (
+              <>
+                <TextInput
+                  mode="outlined"
+                  label="Username"
+                  value={inputValue}
+                  onChangeText={setInputValue}
+                  autoFocus
+                  autoCapitalize="none"
+                  style={{ backgroundColor: theme.colors.surfaceVariant, marginBottom: 12 }}
+                />
+                <TextInput
+                  mode="outlined"
+                  label="Password"
+                  value={inputPassword}
+                  onChangeText={setInputPassword}
+                  secureTextEntry
+                  style={{ backgroundColor: theme.colors.surfaceVariant }}
+                />
+              </>
+            ) : (
+              <TextInput
+                mode="outlined"
+                value={inputValue}
+                onChangeText={setInputValue}
+                placeholder={inputDialog ? INPUT_CONFIG[inputDialog.inputKey]?.placeholder : ''}
+                autoFocus
+                autoCapitalize="none"
+                multiline={inputDialog?.inputKey === 'text'}
+                numberOfLines={inputDialog?.inputKey === 'text' ? 4 : 1}
+                style={{ backgroundColor: theme.colors.surfaceVariant }}
+              />
+            )}
           </Dialog.Content>
           <Dialog.Actions>
-            <Button onPress={() => setInputDialog(null)}>Cancel</Button>
-            <Button mode="contained" onPress={handleInputConfirm} disabled={!inputValue.trim()}>Send</Button>
+            <Button onPress={() => { setInputDialog(null); setInputValue(''); setInputPassword(''); }}>Cancel</Button>
+            <Button
+              mode="contained"
+              onPress={handleInputConfirm}
+              disabled={!inputValue.trim()}
+            >
+              Send
+            </Button>
           </Dialog.Actions>
         </Dialog>
       </Portal>

@@ -234,54 +234,101 @@ public class VeyonVncClient {
         return veyonType;
     }
 
-    // ─── Veyon Authentication ──────────────────────────────────────────────────
+
+    // ─── Veyon Authentication (versione migliorata) ────────────────────────────
 
     private void veyonAuthenticate() throws Exception {
         // Receive available auth types as VariantArrayMessage
         int[] authTypes = receiveVariantIntArray();
-        Log.d(TAG, "Available auth types: " + java.util.Arrays.toString(authTypes));
+        Log.d(TAG, "Available auth types raw: " + java.util.Arrays.toString(authTypes));
 
-        boolean hasKeyFile = false;
-        for (int t : authTypes) {
-            if (t == VEYON_AUTH_KEYFILE) { hasKeyFile = true; break; }
+        // Veyon auth type values (provati empiricamente):
+        // 0 = None, 1 = Logon, 2 = KeyFile (alcune versioni), 3 = KeyFile (altre), 4 = KeyFile
+        // Tentiamo nell'ordine: 3, 2, 4
+        int selectedType = -1;
+        int[] keyFileCandidates = { 3, 2, 4 };
+        for (int candidate : keyFileCandidates) {
+            for (int t : authTypes) {
+                if (t == candidate) { selectedType = candidate; break; }
+            }
+            if (selectedType != -1) break;
         }
-        if (!hasKeyFile) throw new IOException("Server does not support KeyFile auth (type 4)");
 
-        // Send chosen auth type [4]
-        sendVariantIntArray(new int[]{ VEYON_AUTH_KEYFILE });
+        if (selectedType == -1) {
+            throw new IOException("No supported auth type found. Available: " + java.util.Arrays.toString(authTypes));
+        }
 
-        // Receive challenge (as VariantArrayMessage with one QByteArray)
+        Log.d(TAG, "Selected auth type: " + selectedType);
+
+        // Send chosen auth type
+        sendVariantIntArray(new int[]{ selectedType });
+
+        // Receive challenge
         byte[] challenge = receiveVariantByteArray();
-        Log.d(TAG, "Received challenge: " + challenge.length + " bytes");
+        if (challenge.length == 0) {
+            throw new IOException("Empty challenge received from server");
+        }
+        Log.d(TAG, "Challenge received: " + challenge.length + " bytes");
 
-        // Sign challenge with private key
+        // Sign challenge
         byte[] signature = signChallenge(challenge);
         Log.d(TAG, "Signature: " + signature.length + " bytes");
 
-        // Send [keyName, signature] as VariantArrayMessage
+        // Send [keyName, signature]
         sendVariantStringAndBytes(keyName, signature);
+        Log.d(TAG, "Auth response sent");
     }
+
 
     // ─── VariantArrayMessage I/O ───────────────────────────────────────────────
 
     /**
      * Reads a VariantArrayMessage containing integers.
-     * Format: [uint32: msgSize] [uint32: count] { [uint32: QMT_INT] [uint8: isNull] [int32: val] }...
+     * Handles both Qt4 (no isNull) and Qt5 (with isNull) formats.
      */
     private int[] receiveVariantIntArray() throws IOException {
         int msgSize = in.readInt();
-        int count = in.readInt();
+        Log.d(TAG, "receiveVariantIntArray: msgSize=" + msgSize);
+        if (msgSize <= 0 || msgSize > 65536) {
+            throw new IOException("Invalid VariantArrayMessage size: " + msgSize);
+        }
+
+        // Read exactly msgSize bytes into a buffer to avoid desync
+        byte[] buf = new byte[msgSize];
+        in.readFully(buf);
+        java.io.DataInputStream dis = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(buf));
+
+        int count = dis.readInt();
+        Log.d(TAG, "receiveVariantIntArray: count=" + count);
+        if (count < 0 || count > 256) throw new IOException("Invalid variant count: " + count);
+
         int[] result = new int[count];
         for (int i = 0; i < count; i++) {
-            int type = in.readInt();    // QMetaType
-            int isNull = in.readUnsignedByte();
-            if (type == QMT_INT) {
-                result[i] = in.readInt();
-            } else {
-                // Skip unknown types
-                Log.w(TAG, "Unknown QVariant type in int array: " + type);
-                result[i] = 0;
+            int type = dis.readInt();
+            Log.d(TAG, "  variant[" + i + "]: QMetaType=" + type);
+            switch (type) {
+                case 0:  // Invalid — no data
+                    // In Qt5, still has isNull byte; in Qt4, nothing
+                    // Try to skip isNull if there are enough bytes
+                    try { dis.readUnsignedByte(); } catch (Exception e) { /* Qt4 compat */ }
+                    result[i] = 0;
+                    break;
+                case 2:  // Int
+                    dis.readUnsignedByte(); // isNull
+                    result[i] = dis.readInt();
+                    break;
+                case 3:  // UInt
+                    dis.readUnsignedByte();
+                    result[i] = dis.readInt() & 0xFFFF;
+                    break;
+                default:
+                    Log.w(TAG, "  Unknown QMetaType " + type + " for variant[" + i + "]");
+                    dis.readUnsignedByte(); // try to read isNull
+                    result[i] = 0;
+                    break;
             }
+            Log.d(TAG, "  variant[" + i + "]: value=" + result[i]);
         }
         return result;
     }
@@ -309,18 +356,35 @@ public class VeyonVncClient {
      */
     private byte[] receiveVariantByteArray() throws IOException {
         int msgSize = in.readInt();
-        int count = in.readInt();
+        Log.d(TAG, "receiveVariantByteArray: msgSize=" + msgSize);
+        if (msgSize <= 0 || msgSize > 65536) {
+            throw new IOException("Invalid VariantArrayMessage size for bytearray: " + msgSize);
+        }
+
+        byte[] buf = new byte[msgSize];
+        in.readFully(buf);
+        java.io.DataInputStream dis = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(buf));
+
+        int count = dis.readInt();
+        Log.d(TAG, "receiveVariantByteArray: count=" + count);
         if (count == 0) return new byte[0];
 
-        int type = in.readInt();      // should be QMT_BYTEARRAY (12)
-        int isNull = in.readUnsignedByte();
-        if (isNull != 0) return new byte[0];
-        int len = in.readInt();
+        int type = dis.readInt();
+        Log.d(TAG, "receiveVariantByteArray: type=" + type);
+        int isNull = dis.readUnsignedByte();
+        if (isNull != 0) {
+            Log.w(TAG, "Challenge variant is null");
+            return new byte[0];
+        }
+        int len = dis.readInt();
+        Log.d(TAG, "receiveVariantByteArray: dataLen=" + len);
         if (len < 0) return new byte[0];
         byte[] data = new byte[len];
-        in.readFully(data);
+        dis.readFully(data);
         return data;
     }
+
 
     /**
      * Sends a VariantArrayMessage with [QString(keyName), QByteArray(signature)].
