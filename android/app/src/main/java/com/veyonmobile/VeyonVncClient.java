@@ -10,6 +10,7 @@ import android.view.SurfaceHolder;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.PushbackInputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -17,6 +18,7 @@ import java.security.KeyFactory;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.Inflater;
 
@@ -33,7 +35,7 @@ import java.util.zip.Inflater;
  *   For each QVariant:
  *     [uint32: type] [uint8: is_null] [data...]
  *
- * QMetaType::Int = 2      -> [int32: value]
+ * QMetaType::Int = 2     -> [int32: value]
  * QMetaType::QByteArray = 12 -> [uint32: len] [bytes...]
  */
 public class VeyonVncClient {
@@ -74,6 +76,8 @@ public class VeyonVncClient {
     private final Callback callback;
 
     private Socket socket;
+    // Utilizziamo PushbackInputStream per poter rimettere byte nello stream se necessario
+    private PushbackInputStream pbIn;
     private DataInputStream in;
     private DataOutputStream out;
     private AtomicBoolean running = new AtomicBoolean(false);
@@ -119,11 +123,14 @@ public class VeyonVncClient {
 
     private void runConnection() {
         try {
-            Log.d(TAG, "=== VeyonVNC starting connection ==="); Log.d(TAG, "Connecting to " + host + ":" + port);
+            Log.d(TAG, "=== VeyonVNC starting connection ===");
+            Log.d(TAG, "Connecting to " + host + ":" + port);
             socket = new Socket(host, port);
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(10000);
-            in = new DataInputStream(socket.getInputStream());
+            // Avvolgiamo in PushbackInputStream per poter rimettere byte
+            pbIn = new PushbackInputStream(socket.getInputStream());
+            in = new DataInputStream(pbIn);
             out = new DataOutputStream(socket.getOutputStream());
 
             // Step 1: RFB version handshake
@@ -235,18 +242,14 @@ public class VeyonVncClient {
     }
 
 
-    // ─── Veyon Authentication (versione migliorata) ────────────────────────────
+    // ─── Veyon Authentication (versione migliorata con debug) ──────────────────
 
     private void veyonAuthenticate() throws Exception {
-        // Receive available auth types as VariantArrayMessage
         int[] authTypes = receiveVariantIntArray();
-        Log.d(TAG, "Available auth types raw: " + java.util.Arrays.toString(authTypes));
+        Log.d(TAG, "Available auth types raw: " + Arrays.toString(authTypes));
 
-        // Veyon auth type values (provati empiricamente):
-        // 0 = None, 1 = Logon, 2 = KeyFile (alcune versioni), 3 = KeyFile (altre), 4 = KeyFile
-        // Tentiamo nell'ordine: 3, 2, 4
         int selectedType = -1;
-        int[] keyFileCandidates = { 3, 2, 4 };
+        int[] keyFileCandidates = { 3, 2, 4, 0 };
         for (int candidate : keyFileCandidates) {
             for (int t : authTypes) {
                 if (t == candidate) { selectedType = candidate; break; }
@@ -255,30 +258,88 @@ public class VeyonVncClient {
         }
 
         if (selectedType == -1) {
-            throw new IOException("No supported auth type found. Available: " + java.util.Arrays.toString(authTypes));
+            throw new IOException("No supported auth type found. Available: " + Arrays.toString(authTypes));
         }
 
         Log.d(TAG, "Selected auth type: " + selectedType);
+        Log.d(TAG, "Tentativo di invio tipo autenticazione come intero grezzo: " + selectedType);
+        out.writeInt(selectedType);
+        out.flush();
+        Log.d(TAG, "Auth type sent, waiting for response...");
 
-        // Send chosen auth type
-        sendVariantIntArray(new int[]{ selectedType });
-
-        // Receive challenge
-        byte[] challenge = receiveVariantByteArray();
-        if (challenge.length == 0) {
-            throw new IOException("Empty challenge received from server");
+        // Tentativo di leggere un singolo byte per vedere se arriva qualcosa
+        int firstByte = -1;
+        try {
+            // Imposta un timeout breve per non bloccare all'infinito
+            socket.setSoTimeout(5000);
+            firstByte = in.read(); // Legge un byte (bloccante con timeout)
+            Log.d(TAG, "First byte read: " + firstByte + " (hex: " + Integer.toHexString(firstByte) + ")");
+        } catch (java.net.SocketTimeoutException e) {
+            Log.e(TAG, "Timeout reading first byte after auth type");
+            throw new IOException("Timeout waiting for server response");
+        } catch (IOException e) {
+            Log.e(TAG, "IOException reading first byte: " + e.getMessage(), e);
+            throw e;
+        } finally {
+            socket.setSoTimeout(10000); // ripristina timeout
         }
-        Log.d(TAG, "Challenge received: " + challenge.length + " bytes");
 
-        // Sign challenge
-        byte[] signature = signChallenge(challenge);
-        Log.d(TAG, "Signature: " + signature.length + " bytes");
+        if (firstByte == -1) {
+            Log.e(TAG, "Server closed connection (EOF) after auth type");
+            throw new IOException("Server closed connection");
+        }
 
-        // Send [keyName, signature]
-        sendVariantStringAndBytes(keyName, signature);
-        Log.d(TAG, "Auth response sent");
+        // RIMETTIAMO IL BYTE LETTO NELLO STREAM
+        pbIn.unread(firstByte);
+
+        // Ora possiamo procedere con la logica originale, ma abbiamo già consumato un byte.
+        // Dobbiamo ricostruire l'header di 4 byte (mancano 3 byte)
+        byte[] remainingHeader = new byte[3];
+        int readRemaining = pbIn.read(remainingHeader);
+        if (readRemaining != 3) {
+            Log.e(TAG, "Failed to read remaining header bytes, got: " + readRemaining);
+            throw new IOException("Incomplete header after auth type");
+        }
+
+        // Ricomponiamo i 4 byte originali
+        byte[] fullHeader = new byte[4];
+        fullHeader[0] = (byte) firstByte;
+        System.arraycopy(remainingHeader, 0, fullHeader, 1, 3);
+        Log.d(TAG, "Full 4-byte header: " + bytesToHex(fullHeader));
+
+        // Rimettere i 4 byte nello stream per permettere le letture successive
+        pbIn.unread(fullHeader);
+
+        // Ora interpretiamo come intero
+        int possibleResult = ByteBuffer.wrap(fullHeader).order(ByteOrder.BIG_ENDIAN).getInt();
+        Log.d(TAG, "Interpreted as int: " + possibleResult + " (hex: " + Integer.toHexString(possibleResult) + ")");
+
+        if (possibleResult == 0 && selectedType != 0) {
+            // Potrebbe essere SecurityResult = 0
+            Log.d(TAG, "Received 0, checking if more data available...");
+            if (pbIn.available() > 0) {
+                Log.d(TAG, "More data available, assuming challenge follows");
+                // Procedi con la lettura della sfida normalmente (riutilizzando i metodi esistenti)
+                byte[] challenge = receiveVariantByteArray();
+                Log.d(TAG, "Challenge received, length: " + challenge.length);
+                byte[] signature = signChallenge(challenge);
+                sendVariantStringAndBytes(keyName, signature);
+            } else {
+                Log.d(TAG, "No more data, assuming authentication successful without challenge");
+                return; // Autenticazione completata
+            }
+        } else {
+            // Non è 0, quindi probabilmente è la dimensione di un messaggio
+            byte[] challenge = receiveVariantByteArray();
+            Log.d(TAG, "Challenge received, length: " + challenge.length);
+            if (challenge.length == 0) {
+                throw new IOException("Empty challenge received");
+            }
+            byte[] signature = signChallenge(challenge);
+            sendVariantStringAndBytes(keyName, signature);
+            Log.d(TAG, "Auth response sent");
+        }
     }
-
 
     // ─── VariantArrayMessage I/O ───────────────────────────────────────────────
 
@@ -430,8 +491,14 @@ public class VeyonVncClient {
         KeyFactory factory = KeyFactory.getInstance("RSA");
         PrivateKey privateKey = factory.generatePrivate(spec);
 
-        // Sign with SHA256withRSA (PKCS1v15)
-        Signature sig = Signature.getInstance("SHA256withRSA");
+        // Prova con SHA256, ma Veyon potrebbe usare SHA1
+        Signature sig;
+        try {
+            sig = Signature.getInstance("SHA256withRSA");
+        } catch (Exception e) {
+            Log.w(TAG, "SHA256withRSA not available, trying SHA1withRSA");
+            sig = Signature.getInstance("SHA1withRSA");
+        }
         sig.initSign(privateKey);
         sig.update(challenge);
         return sig.sign();
@@ -652,6 +719,13 @@ public class VeyonVncClient {
             }
         }
     }
+
+    // Utility: bytes to hex
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02X ", b));
+        }
+        return sb.toString();
+    }
 }
-
-
