@@ -913,3 +913,6 @@ veyon_source/veyon-4.10.1/worker/src/main.cpp
 veyon_source/veyon-4.10.1/worker/src/VeyonWorker.cpp
 veyon_source/veyon-4.10.1/worker/src/VeyonWorker.h
 veyon_source/veyon-4.10.1/worker/veyon-worker.1
+veyon_source/veyon-4.10.1/.ci/android.arm64-v8a/build.sh
+veyon_source/veyon-4.10.1/.ci/android.armeabi-v7a/build.sh
+veyon_source/veyon-4.10.1/.ci/common/finalize-deb.sh
