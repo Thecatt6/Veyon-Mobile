@@ -1,70 +1,31 @@
-import React, { useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { View, StyleSheet, ScrollView } from 'react-native';
-import { Text, useTheme, Appbar, List, Divider, RadioButton, Chip, TextInput } from 'react-native-paper';
+import {
+  Text, useTheme, Appbar, List, Switch, Divider,
+  SegmentedButtons, TextInput, Button, Snackbar,
+} from 'react-native-paper';
 import { useFocusEffect } from '@react-navigation/native';
 import { getSettings, saveSettings } from '../controllers/StorageController';
-
-const RENDERERS = [
-  {
-    value: 'image',
-    label: '🖼️ React Native Image',
-    description: 'Base64 → React state. Compatibile con tutto, ma lento (5-10 FPS).',
-    badge: 'Stabile',
-    badgeColor: '#3FB950',
-  },
-  {
-    value: 'skia',
-    label: '⚡ Skia GPU',
-    description: 'Bytes diretti → GPU. Più veloce, usa hardware grafico (20-40 FPS).',
-    badge: 'Consigliato',
-    badgeColor: '#58A6FF',
-  },
-  {
-    value: 'native',
-    label: '🚀 Native SurfaceView',
-    description: 'BitmapFactory Android nativo, fuori dal thread JS (30-60 FPS).',
-    badge: 'Più veloce',
-    badgeColor: '#C792EA',
-  },
-  {
-    value: 'vnc',
-    label: '🔗 VNC Nativo (Veyon)',
-    description: 'Connessione TCP diretta alla porta VNC di Veyon (porta 11100). Solo aree cambiate, 30-60 FPS stabili. Richiede rebuild.',
-    badge: 'Sperimentale',
-    badgeColor: '#FF9800',
-  },
-];
-
-const QUALITY_OPTIONS = [
-  { value: 30, label: 'Bassa (più veloce)' },
-  { value: 50, label: 'Media (consigliata)' },
-  { value: 70, label: 'Alta (più lenta)' },
-  { value: 90, label: 'Massima' },
-];
-
-const COMPRESSION_OPTIONS = [
-  { value: 9, label: 'Alta compressione (più veloce)' },
-  { value: 6, label: 'Media (bilanciata)' },
-  { value: 3, label: 'Bassa (più qualità)' },
-];
 
 const SettingsScreen = ({ navigation }) => {
   const theme = useTheme();
   const [settings, setSettings] = useState(null);
+  const [saved, setSaved] = useState(false);
 
   useFocusEffect(useCallback(() => {
     getSettings().then(setSettings);
   }, []));
 
-  const updateSetting = async (key, value) => {
-    const updated = { ...settings, [key]: value };
-    setSettings(updated);
+  const update = async (key, value) => {
+    const next = { ...settings, [key]: value };
+    setSettings(next);
     await saveSettings({ [key]: value });
+    setSaved(true);
   };
 
-  const s = styles(theme);
-
   if (!settings) return null;
+
+  const s = styles(theme);
 
   return (
     <View style={s.container}>
@@ -73,107 +34,173 @@ const SettingsScreen = ({ navigation }) => {
         <Appbar.Content title="Settings" titleStyle={s.appbarTitle} />
       </Appbar.Header>
 
-      <ScrollView contentContainerStyle={s.content}>
+      <ScrollView contentContainerStyle={s.scroll}>
 
-        {/* ── Renderer ── */}
-        <Text style={s.sectionLabel}>RENDERER FRAMEBUFFER</Text>
+        {/* ── Metodo di connessione ───────────────────────────────────────── */}
+        <Text style={s.sectionLabel}>CONNECTION METHOD</Text>
         <View style={s.card}>
-          {RENDERERS.map((r, i) => (
-            <React.Fragment key={r.value}>
-              <View style={s.rendererRow}>
-                <RadioButton
-                  value={r.value}
-                  status={settings.renderer === r.value ? 'checked' : 'unchecked'}
-                  color={theme.colors.primary}
-                  onPress={() => updateSetting('renderer', r.value)}
-                />
-                <View style={s.rendererInfo}>
-                  <View style={s.rendererHeader}>
-                    <Text style={s.rendererLabel}>{r.label}</Text>
-                    <Chip
-                      compact
-                      style={[s.badge, { backgroundColor: r.badgeColor + '22' }]}
-                      textStyle={[s.badgeText, { color: r.badgeColor }]}
-                    >
-                      {r.badge}
-                    </Chip>
-                  </View>
-                  <Text style={s.rendererDesc}>{r.description}</Text>
-                </View>
-              </View>
-              {i < RENDERERS.length - 1 && <Divider style={{ backgroundColor: theme.colors.outline }} />}
-            </React.Fragment>
-          ))}
+          <Text style={s.settingTitle}>Protocol</Text>
+          <Text style={s.settingDesc}>
+            WebAPI uses HTTP (requires Veyon WebAPI plugin).{'\n'}
+            VNC uses the native Veyon protocol on port 11100 (always available).
+          </Text>
+          <SegmentedButtons
+            value={settings.connectionMethod}
+            onValueChange={(v) => update('connectionMethod', v)}
+            density="small"
+            style={{ marginTop: 12 }}
+            buttons={[
+              { value: 'webapi', label: '🌐 WebAPI (HTTP)', icon: 'web' },
+              { value: 'vnc',    label: '🖥️ VNC (native)',   icon: 'monitor' },
+            ]}
+          />
+          {settings.connectionMethod === 'webapi' && (
+            <TextInput
+              mode="outlined"
+              label="WebAPI Port"
+              value={String(settings.webApiPort)}
+              onChangeText={(v) => update('webApiPort', parseInt(v) || 11080)}
+              keyboardType="number-pad"
+              dense
+              style={[s.input, { marginTop: 12 }]}
+            />
+          )}
+          {settings.connectionMethod === 'vnc' && (
+            <TextInput
+              mode="outlined"
+              label="VNC Port"
+              value={String(settings.vncPort)}
+              onChangeText={(v) => update('vncPort', parseInt(v) || 11100)}
+              keyboardType="number-pad"
+              dense
+              style={[s.input, { marginTop: 12 }]}
+            />
+          )}
         </View>
 
-        {/* ── Qualità frame ── */}
-        <Text style={[s.sectionLabel, { marginTop: 24 }]}>QUALITÀ FRAME (JPEG)</Text>
+        <Divider style={s.divider} />
+
+        {/* ── Renderer ────────────────────────────────────────────────────── */}
+        <Text style={s.sectionLabel}>FRAMEBUFFER RENDERER</Text>
         <View style={s.card}>
-          {QUALITY_OPTIONS.map((q, i) => (
-            <React.Fragment key={q.value}>
-              <View style={s.optionRow}>
-                <RadioButton
-                  value={String(q.value)}
-                  status={settings.frameQuality === q.value ? 'checked' : 'unchecked'}
-                  color={theme.colors.primary}
-                  onPress={() => updateSetting('frameQuality', q.value)}
-                />
-                <Text style={s.optionLabel}>{q.label}</Text>
-              </View>
-              {i < QUALITY_OPTIONS.length - 1 && <Divider style={{ backgroundColor: theme.colors.outline }} />}
-            </React.Fragment>
-          ))}
+          <Text style={s.settingTitle}>Rendering engine</Text>
+          <Text style={s.settingDesc}>
+            Image: compatibile, bassa CPU.{'\n'}
+            Skia: GPU accelerato, migliori FPS.{'\n'}
+            Native SurfaceView: massima velocità, solo VNC.
+          </Text>
+          <SegmentedButtons
+            value={settings.renderer}
+            onValueChange={(v) => update('renderer', v)}
+            density="small"
+            style={{ marginTop: 12 }}
+            buttons={[
+              { value: 'image',  label: 'Image' },
+              { value: 'skia',   label: 'Skia' },
+              { value: 'native', label: 'Native' },
+            ]}
+          />
         </View>
 
-        {/* ── Compressione ── */}
-        <Text style={[s.sectionLabel, { marginTop: 24 }]}>COMPRESSIONE</Text>
+        <Divider style={s.divider} />
+
+        {/* ── Qualità ─────────────────────────────────────────────────────── */}
+        <Text style={s.sectionLabel}>FRAME QUALITY</Text>
         <View style={s.card}>
-          {COMPRESSION_OPTIONS.map((c, i) => (
-            <React.Fragment key={c.value}>
-              <View style={s.optionRow}>
-                <RadioButton
-                  value={String(c.value)}
-                  status={settings.frameCompression === c.value ? 'checked' : 'unchecked'}
-                  color={theme.colors.primary}
-                  onPress={() => updateSetting('frameCompression', c.value)}
-                />
-                <Text style={s.optionLabel}>{c.label}</Text>
-              </View>
-              {i < COMPRESSION_OPTIONS.length - 1 && <Divider style={{ backgroundColor: theme.colors.outline }} />}
-            </React.Fragment>
-          ))}
-        </View>
-
-        <Text style={s.hint}>
-          Le impostazioni vengono applicate alla prossima connessione.{'\n'}
-          NativeSurfaceView e VNC richiedono un rebuild dopo la prima installazione.
-        </Text>
-
-        {/* ── VNC Port ── */}
-        {settings.renderer === 'vnc' && (
-          <>
-            <Text style={[s.sectionLabel, { marginTop: 24 }]}>PORTA VNC</Text>
-            <View style={s.card}>
-              <View style={{ padding: 12 }}>
-                <TextInput
-                  mode="outlined"
-                  label="Porta VNC di Veyon"
-                  value={String(settings.vncPort || 11100)}
-                  onChangeText={(v) => {
-                    const n = parseInt(v);
-                    if (!isNaN(n)) updateSetting('vncPort', n);
-                  }}
-                  keyboardType="number-pad"
-                  style={{ backgroundColor: theme.colors.surfaceVariant }}
-                />
-                <Text style={[s.hint, { marginTop: 8, textAlign: 'left' }]}>
-                  Default: 11100 — è la porta VNC interna di Veyon Service.
-                </Text>
-              </View>
+          <View style={s.row}>
+            <View style={s.rowLabel}>
+              <Text style={s.settingTitle}>JPEG Quality</Text>
+              <Text style={s.settingDesc}>1-100. Più alto = migliore qualità, più banda.</Text>
             </View>
-          </>
-        )}
+            <TextInput
+              mode="outlined"
+              value={String(settings.frameQuality)}
+              onChangeText={(v) => {
+                const n = Math.max(1, Math.min(100, parseInt(v) || 50));
+                update('frameQuality', n);
+              }}
+              keyboardType="number-pad"
+              dense
+              style={s.numInput}
+            />
+          </View>
+
+          <Divider style={{ marginVertical: 12, backgroundColor: theme.colors.outline }} />
+
+          <View style={s.row}>
+            <View style={s.rowLabel}>
+              <Text style={s.settingTitle}>Compression</Text>
+              <Text style={s.settingDesc}>1-9. Più alto = più compresso, più CPU.</Text>
+            </View>
+            <TextInput
+              mode="outlined"
+              value={String(settings.frameCompression)}
+              onChangeText={(v) => {
+                const n = Math.max(1, Math.min(9, parseInt(v) || 8));
+                update('frameCompression', n);
+              }}
+              keyboardType="number-pad"
+              dense
+              style={s.numInput}
+            />
+          </View>
+
+          <Divider style={{ marginVertical: 12, backgroundColor: theme.colors.outline }} />
+
+          <View style={s.row}>
+            <View style={s.rowLabel}>
+              <Text style={s.settingTitle}>Frame throttle (ms)</Text>
+              <Text style={s.settingDesc}>0 = massima velocità. 100 = ~10 FPS max.</Text>
+            </View>
+            <TextInput
+              mode="outlined"
+              value={String(settings.frameThrottleMs)}
+              onChangeText={(v) => {
+                const n = Math.max(0, Math.min(1000, parseInt(v) || 0));
+                update('frameThrottleMs', n);
+              }}
+              keyboardType="number-pad"
+              dense
+              style={s.numInput}
+            />
+          </View>
+        </View>
+
+        <Divider style={s.divider} />
+
+        {/* ── Info ────────────────────────────────────────────────────────── */}
+        <Text style={s.sectionLabel}>INFO</Text>
+        <View style={s.card}>
+          <View style={s.row}>
+            <Text style={[s.settingTitle, { flex: 1 }]}>Connection method</Text>
+            <Text style={[s.settingDesc, { color: theme.colors.primary }]}>
+              {settings.connectionMethod === 'webapi' ? `WebAPI :${settings.webApiPort}` : `VNC :${settings.vncPort}`}
+            </Text>
+          </View>
+          <View style={[s.row, { marginTop: 8 }]}>
+            <Text style={[s.settingTitle, { flex: 1 }]}>Renderer</Text>
+            <Text style={[s.settingDesc, { color: theme.colors.primary }]}>
+              {settings.renderer}
+            </Text>
+          </View>
+          <View style={[s.row, { marginTop: 8 }]}>
+            <Text style={[s.settingTitle, { flex: 1 }]}>Quality</Text>
+            <Text style={[s.settingDesc, { color: theme.colors.primary }]}>
+              Q{settings.frameQuality} C{settings.frameCompression} T{settings.frameThrottleMs}ms
+            </Text>
+          </View>
+        </View>
+
       </ScrollView>
+
+      <Snackbar
+        visible={saved}
+        onDismiss={() => setSaved(false)}
+        duration={1500}
+        style={{ backgroundColor: theme.colors.surfaceVariant }}
+      >
+        <Text style={{ color: theme.colors.onSurface }}>✓ Saved</Text>
+      </Snackbar>
     </View>
   );
 };
@@ -182,38 +209,26 @@ const styles = (theme) => StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.colors.background },
   appbar: { backgroundColor: theme.colors.surface, elevation: 0, borderBottomWidth: 1, borderBottomColor: theme.colors.outline },
   appbarTitle: { fontSize: 18, fontWeight: '700', color: theme.colors.onSurface },
-  content: { padding: 20, paddingBottom: 40 },
+  scroll: { padding: 16, paddingBottom: 40 },
   sectionLabel: {
     fontSize: 11, fontWeight: '700', color: theme.colors.onSurfaceVariant,
-    letterSpacing: 1.2, marginBottom: 10,
+    letterSpacing: 1.2, marginBottom: 8, marginTop: 4,
   },
   card: {
     backgroundColor: theme.colors.surface,
     borderRadius: 10,
+    padding: 16,
     borderWidth: 1,
     borderColor: theme.colors.outline,
-    overflow: 'hidden',
+    marginBottom: 4,
   },
-  rendererRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    padding: 12,
-  },
-  rendererInfo: { flex: 1, marginLeft: 4 },
-  rendererHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
-  rendererLabel: { fontSize: 14, fontWeight: '600', color: theme.colors.onSurface, flex: 1 },
-  rendererDesc: { fontSize: 12, color: theme.colors.onSurfaceVariant, lineHeight: 18 },
-  badge: { borderRadius: 4 },
-  badgeText: { fontSize: 10, fontWeight: '700' },
-  optionRow: { flexDirection: 'row', alignItems: 'center', padding: 12 },
-  optionLabel: { fontSize: 14, color: theme.colors.onSurface, marginLeft: 4 },
-  hint: {
-    marginTop: 20,
-    fontSize: 12,
-    color: theme.colors.onSurfaceVariant,
-    textAlign: 'center',
-    lineHeight: 20,
-  },
+  settingTitle: { fontSize: 14, fontWeight: '600', color: theme.colors.onSurface },
+  settingDesc: { fontSize: 12, color: theme.colors.onSurfaceVariant, marginTop: 2, lineHeight: 18 },
+  divider: { backgroundColor: theme.colors.outline, marginVertical: 12 },
+  input: { backgroundColor: theme.colors.surfaceVariant },
+  row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  rowLabel: { flex: 1, marginRight: 12 },
+  numInput: { width: 80, backgroundColor: theme.colors.surfaceVariant },
 });
 
 export default SettingsScreen;

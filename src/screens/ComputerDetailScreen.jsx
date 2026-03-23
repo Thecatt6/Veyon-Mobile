@@ -80,10 +80,12 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   const [inputPassword, setInputPassword] = useState('');
 
   // ── Renderer state ───────────────────────────────────────────────────────────
-  const [renderer, setRenderer] = useState('skia');
+  const [renderer, setRenderer] = useState('image');
+  const [connectionMethod, setConnectionMethod] = useState('webapi'); // 'webapi' | 'vnc'
   const [frameQuality, setFrameQuality] = useState(50);
-  const [frameCompression, setFrameCompression] = useState(6);
+  const [frameCompression, setFrameCompression] = useState(8);
   const [vncPort, setVncPort] = useState(11100);
+  const [frameThrottleMs, setFrameThrottleMs] = useState(100);
 
   // Frame state for each renderer
   const [imageFrame, setImageFrame] = useState(null);   // base64 URI
@@ -91,6 +93,7 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   const [nativeFrame, setNativeFrame] = useState(null); // base64 URI for NativeSurfaceView
 
   const sessionRef = useRef(null);
+  const authKeyRef = useRef(null); // { keyName, privateKey } per VNC
   const mountedRef = useRef(true);
   const cancelStreamRef = useRef(null);
   const fpsCountRef = useRef(0);
@@ -105,9 +108,12 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   // ── Load settings on mount ────────────────────────────────────────────────
   useEffect(() => {
     getSettings().then((s) => {
-      setRenderer(s.renderer || 'skia');
+      setRenderer(s.renderer || 'image');
+      setConnectionMethod(s.connectionMethod || 'webapi');
       setFrameQuality(s.frameQuality || 50);
-      setFrameCompression(s.frameCompression || 6);
+      setFrameCompression(s.frameCompression || 8);
+      setVncPort(s.vncPort || 11100);
+      setFrameThrottleMs(s.frameThrottleMs ?? 100);
     });
   }, []);
 
@@ -177,36 +183,35 @@ const ComputerDetailScreen = ({ route, navigation }) => {
 
   // ── Init ──────────────────────────────────────────────────────────────────
   const initialize = useCallback(async () => {
-    const [keys, settings] = await Promise.all([getAuthKeys(), getSettings()]);
+    const [keys, s] = await Promise.all([getAuthKeys(), getSettings()]);
     const keyList = Object.values(keys);
-    const r = settings.renderer || 'skia';
-    const q = settings.frameQuality || 50;
-    const c = settings.frameCompression || 6;
-    const vp = settings.vncPort || 11100;
-    setRenderer(r); setFrameQuality(q); setFrameCompression(c); setVncPort(vp);
+    const r = s.renderer || 'image';
+    const q = s.frameQuality || 50;
+    const c = s.frameCompression || 8;
+    const vp = s.vncPort || 11100;
+    const method = s.connectionMethod || 'webapi';
+    const throttle = s.frameThrottleMs ?? 100;
+
+    setRenderer(r);
+    setFrameQuality(q);
+    setFrameCompression(c);
+    setVncPort(vp);
+    setConnectionMethod(method);
+    setFrameThrottleMs(throttle);
 
     if (keyList.length === 0) { setStatus('no-auth'); return; }
 
-    // VNC mode: just authenticate to get session info, skip HTTP stream
-    if (r === 'vnc') {
-      for (const key of keyList) {
-        try {
-          const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
-          if (!mountedRef.current) return;
-          sessionRef.current = session;
-          try {
-            const user = await getSessionUser(baseURL, session.connectionUid);
-            if (mountedRef.current) setUserLabel(user || '');
-          } catch { /* non-blocking */ }
-          if (mountedRef.current) setStatus('live');
-          setTimeout(() => loadFeatures(session.connectionUid), 800);
-          return;
-        } catch (e) { console.log('Auth error:', e?.message); }
+    // VNC mode: salta completamente la WebAPI, vai diretto allo stream VNC
+    if (method === 'vnc') {
+      // Carica la chiave per passarla a VeyonVncView
+      if (keyList.length > 0) {
+        authKeyRef.current = { keyName: keyList[0].keyName, privateKey: keyList[0].privateKey };
       }
-      if (mountedRef.current) setStatus('error');
+      if (mountedRef.current) setStatus('live');
       return;
     }
 
+    // WebAPI mode: autenticazione + stream HTTP
     for (const key of keyList) {
       try {
         const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
@@ -238,7 +243,6 @@ const ComputerDetailScreen = ({ route, navigation }) => {
 
   // ── Feature execution ─────────────────────────────────────────────────────
   const executeFeature = useCallback(async (feature, args = {}) => {
-    console.log('Executing:', feature.name, 'args:', JSON.stringify(args));
     if (!sessionRef.current) return;
     const meta = getMeta(feature);
     const newActive = meta.toggle ? !feature.active : true;
@@ -305,20 +309,19 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   }, [inputDialog, inputValue, inputPassword, executeFeature]);
 
   const s = styles(theme);
-  const hasFrame = imageFrame || skiaFrame || nativeFrame || renderer === 'vnc';
+  const hasFrame = imageFrame || skiaFrame || nativeFrame || connectionMethod === 'vnc';
 
-  // ── Render framebuffer based on renderer setting ────────────────────────────
+  // ── Render framebuffer based on settings ────────────────────────────────────
   const renderFrame = () => {
-    if (renderer === 'vnc') {
-      const authBody = sessionRef.current?.authBody;
+    if (connectionMethod === 'vnc') {
       return (
         <VeyonVncView
           host={computer.ip}
           port={vncPort}
-          keyName={authBody?.credentials?.keyname || ''}
-          privateKey={authBody?.credentials?.keydata || ''}
+          keyName={authKeyRef.current?.keyName || ''}
+          privateKey={authKeyRef.current?.privateKey || ''}
           style={{ width: W, height: frameHeight }}
-          onConnected={() => setStatus('live')}
+          onConnected={() => { if (mountedRef.current) setStatus('live'); }}
           onError={(e) => console.warn('VNC error:', e)}
         />
       );

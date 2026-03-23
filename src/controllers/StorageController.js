@@ -7,10 +7,13 @@ const SETTINGS_KEY = '@mc_settings';
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS = {
-  renderer: 'skia',   // 'image' | 'skia' | 'native' | 'vnc'
+  connectionMethod: 'webapi', // 'webapi' | 'vnc'
+  renderer: 'image',          // 'image' | 'skia' | 'native'
   frameQuality: 50,
-  frameCompression: 6,
+  frameCompression: 8,
   vncPort: 11100,
+  webApiPort: 11080,
+  frameThrottleMs: 100,       // ms tra un frame e il prossimo (0 = max speed)
 };
 
 async function getSettings() {

@@ -29,6 +29,13 @@ const VeyonVncView = ({
   const [resolution, setResolution] = useState('');
   const surfaceReady = useRef(false);
   const connected = useRef(false);
+  const onConnectedRef = useRef(onConnected);
+  const onDisconnectedRef = useRef(onDisconnected);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => { onConnectedRef.current = onConnected; }, [onConnected]);
+  useEffect(() => { onDisconnectedRef.current = onDisconnected; }, [onDisconnected]);
+  useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
   const doConnect = useCallback(() => {
     if (!surfaceReady.current || !host || !keyName || !privateKey) {
@@ -43,21 +50,22 @@ const VeyonVncView = ({
       .then((res) => {
         setResolution(res);
         setStatus('live');
-        onConnected?.();
+        onConnectedRef.current?.();
       })
       .catch((err) => {
         connected.current = false;
         setStatus('error');
         console.warn('VNC connect error:', err.message);
-        onError?.(err.message);
+        onErrorRef.current?.(err.message);
       });
-  }, [host, port, keyName, privateKey, onConnected, onError]);
+  }, [host, port, keyName, privateKey]);
 
   // Retry when props change (e.g. when keyName/privateKey arrive after mount)
   useEffect(() => {
+    // Reconnect only when connection params change, not on every parent re-render.
     connected.current = false;
     doConnect();
-  }, [doConnect]);
+  }, [host, port, keyName, privateKey, doConnect]);
 
   useEffect(() => {
     if (!emitter) return;
@@ -66,7 +74,7 @@ const VeyonVncView = ({
       emitter.addListener('veyonVncDisconnected', (reason) => {
         connected.current = false;
         setStatus('error');
-        onDisconnected?.(reason);
+        onDisconnectedRef.current?.(reason);
       }),
     ];
     return () => {

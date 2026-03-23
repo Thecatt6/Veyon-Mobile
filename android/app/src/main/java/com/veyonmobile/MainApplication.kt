@@ -15,6 +15,8 @@ class MainApplication : Application(), ReactApplication {
       packageList =
         PackageList(this).packages.apply {
           add(VeyonSurfaceViewPackage())
+          add(FileReaderPackage())
+          add(NetworkProbePackage())
         },
     )
   }

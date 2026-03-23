@@ -1,59 +1,100 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { View, FlatList, StyleSheet, TouchableOpacity } from 'react-native';
-import { Text, useTheme, Appbar, Button, Checkbox, ProgressBar, Divider, TextInput } from 'react-native-paper';
+import { Text, useTheme, Appbar, Button, Checkbox, ProgressBar, Divider, TextInput, SegmentedButtons } from 'react-native-paper';
 import 'react-native-get-random-values';
 import { v4 as uuidv4 } from 'uuid';
-import { startDiscovery, getDefaultRange } from '../controllers/DiscoveryController';
-import { saveComputer } from '../controllers/StorageController';
-import { extraColors } from '../theme';
+import { startDiscovery, expandHostnamePattern, VEYON_VNC_PORT } from '../controllers/DiscoveryController';
+import { saveComputer, getSettings } from '../controllers/StorageController';
 
 const DiscoveryScreen = ({ navigation }) => {
   const theme = useTheme();
-  const [startIP, setStartIP] = useState('');
-  const [endIP, setEndIP] = useState('');
+
+  // ── Modalità scansione ────────────────────────────────────────────────────
+  const [mode, setMode] = useState('subnet'); // 'subnet' | 'hostname_range' | 'ip_range'
+  const [connectionMethod, setConnectionMethod] = useState('vnc');
+  const [subnetInput, setSubnetInput] = useState('');       // es. 192.168.1
+  const [hostnameInput, setHostnameInput] = useState('');   // es. INFO1-PC[01-23]
+  const [ipFrom, setIpFrom] = useState('');
+  const [ipTo, setIpTo] = useState('');
+  const [portInput, setPortInput] = useState(String(VEYON_VNC_PORT));
+
+  // ── Stato scansione ───────────────────────────────────────────────────────
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [found, setFound] = useState([]);
   const [selected, setSelected] = useState({});
   const [saving, setSaving] = useState(false);
-  const [hasScanned, setHasScanned] = useState(false);
+  const [error, setError] = useState('');
   const cancelRef = useRef(null);
 
   useEffect(() => {
-    getDefaultRange().then(({ startIP: s, endIP: e }) => {
-      setStartIP(s);
-      setEndIP(e);
-    });
+    getSettings().then(s => setConnectionMethod(s.connectionMethod || 'vnc'));
   }, []);
 
-  const handleScan = () => {
-    if (!startIP || !endIP) return;
-    cancelRef.current?.();
+  const toggleSelect = (host) => {
+    setSelected(prev => ({ ...prev, [host]: !prev[host] }));
+  };
+
+  // ── Avvia scansione ───────────────────────────────────────────────────────
+  const handleScan = useCallback(() => {
+    setError('');
     setFound([]);
     setSelected({});
     setProgress(0);
     setScanning(true);
-    setHasScanned(true);
+
+    const port = parseInt(portInput) || VEYON_VNC_PORT;
+    let options = { port };
+
+    if (mode === 'hostname_range') {
+      const pattern = hostnameInput.trim();
+      if (!pattern) {
+        setError('Inserisci un pattern hostname. Es: INFO1-PC[01-23]');
+        setScanning(false);
+        return;
+      }
+      options = { ...options, mode: 'hostname_range', hostnamePattern: pattern };
+    } else if (mode === 'ip_range') {
+      if (!ipFrom.trim() || !ipTo.trim()) {
+        setError('Inserisci IP iniziale e finale');
+        setScanning(false);
+        return;
+      }
+      options = { ...options, mode: 'ip_range', ipFrom: ipFrom.trim(), ipTo: ipTo.trim() };
+    } else {
+      options = { ...options, mode: 'subnet', subnet: subnetInput.trim() || undefined };
+    }
 
     cancelRef.current = startDiscovery(
-      startIP, endIP,
+      { ...options, mode: options.mode || 'subnet', connectionMethod },
       (server) => {
-        setFound((prev) => [...prev, server]);
-        setSelected((prev) => ({ ...prev, [server.ip]: true }));
+        setFound(prev => [...prev, server]);
+        setSelected(prev => ({ ...prev, [server.host]: true }));
       },
       (pct) => setProgress(pct / 100),
       () => setScanning(false),
     );
+  }, [mode, subnetInput, hostnameInput, ipFrom, ipTo, portInput]);
+
+  const handleStop = () => {
+    cancelRef.current?.();
+    setScanning(false);
   };
 
-  const toggleSelect = (ip) => setSelected((prev) => ({ ...prev, [ip]: !prev[ip] }));
-
+  // ── Aggiungi selezionati ──────────────────────────────────────────────────
   const handleAddSelected = async () => {
-    const toAdd = found.filter((s) => selected[s.ip]);
+    const toAdd = found.filter(s => selected[s.host]);
     if (toAdd.length === 0) return;
     setSaving(true);
     for (const server of toAdd) {
-      await saveComputer({ id: uuidv4(), ip: server.ip, port: server.port, authURL: server.authURL, label: server.ip });
+      await saveComputer({
+        id: uuidv4(),
+        ip: server.host,
+        port: server.port,
+        authURL: `http://${server.host}:11080/api/v1/authentication/${server.host}:${server.port}`,
+        label: server.host,
+        useVnc: true, // flag per usare VNC invece di WebAPI
+      });
     }
     setSaving(false);
     navigation.goBack();
@@ -65,51 +106,146 @@ const DiscoveryScreen = ({ navigation }) => {
   return (
     <View style={s.container}>
       <Appbar.Header style={s.appbar}>
-        <Appbar.BackAction onPress={() => { cancelRef.current?.(); navigation.goBack(); }} iconColor={theme.colors.onSurface} />
+        <Appbar.BackAction
+          onPress={() => { cancelRef.current?.(); navigation.goBack(); }}
+          iconColor={theme.colors.onSurface}
+        />
         <Appbar.Content title="Discover Computers" titleStyle={s.appbarTitle} />
       </Appbar.Header>
 
-      <View style={s.rangeContainer}>
-        <Text style={s.sectionLabel}>IP RANGE</Text>
-        <View style={s.rangeRow}>
-          <TextInput label="Start IP" value={startIP} onChangeText={setStartIP} mode="outlined" style={s.rangeInput} keyboardType="numeric" autoCapitalize="none" disabled={scanning} />
-          <Text style={s.rangeSeparator}>→</Text>
-          <TextInput label="End IP" value={endIP} onChangeText={setEndIP} mode="outlined" style={s.rangeInput} keyboardType="numeric" autoCapitalize="none" disabled={scanning} />
+      {/* Modalità */}
+      <View style={s.configSection}>
+        <SegmentedButtons
+          value={mode}
+          onValueChange={setMode}
+          density="small"
+          buttons={[
+            { value: 'subnet', label: 'Subnet' },
+            { value: 'hostname_range', label: 'Hostname' },
+            { value: 'ip_range', label: 'IP Range' },
+          ]}
+          style={{ marginBottom: 12 }}
+        />
+
+        {mode === 'subnet' && (
+          <TextInput
+            mode="outlined"
+            label="Subnet (vuoto = auto)"
+            value={subnetInput}
+            onChangeText={setSubnetInput}
+            placeholder="192.168.1"
+            autoCapitalize="none"
+            keyboardType="default"
+            dense
+            style={s.input}
+          />
+        )}
+
+        {mode === 'hostname_range' && (
+          <TextInput
+            mode="outlined"
+            label="Range hostname"
+            value={hostnameInput}
+            onChangeText={setHostnameInput}
+            placeholder="INFO1-PC[01-23] o INFO[1-4]-PCDOC"
+            autoCapitalize="characters"
+            dense
+            style={s.input}
+          />
+        )}
+
+        {mode === 'ip_range' && (
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <TextInput
+              mode="outlined"
+              label="Da IP"
+              value={ipFrom}
+              onChangeText={setIpFrom}
+              placeholder="192.168.1.100"
+              autoCapitalize="none"
+              keyboardType="default"
+              dense
+              style={[s.input, { flex: 1 }]}
+            />
+            <TextInput
+              mode="outlined"
+              label="A IP"
+              value={ipTo}
+              onChangeText={setIpTo}
+              placeholder="192.168.1.150"
+              autoCapitalize="none"
+              keyboardType="default"
+              dense
+              style={[s.input, { flex: 1 }]}
+            />
+          </View>
+        )}
+
+        <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', marginTop: 8 }}>
+          <TextInput
+            mode="outlined"
+            label="Porta"
+            value={portInput}
+            onChangeText={setPortInput}
+            keyboardType="number-pad"
+            dense
+            style={[s.input, { width: 100 }]}
+          />
+          <Button
+            mode="contained"
+            onPress={scanning ? handleStop : handleScan}
+            style={{ flex: 1 }}
+            icon={scanning ? 'stop' : 'magnify'}
+          >
+            {scanning ? 'Stop' : 'Scan'}
+          </Button>
         </View>
-        <Button mode="contained" onPress={handleScan} disabled={scanning || !startIP || !endIP} loading={scanning} style={s.scanButton} icon="magnify">
-          {scanning ? 'Scanning…' : 'Start Scan'}
-        </Button>
+
+        {error ? <Text style={s.errorText}>{error}</Text> : null}
       </View>
 
-      {(scanning || hasScanned) && (
-        <>
-          <View style={s.progressContainer}>
-            <ProgressBar progress={scanning ? progress : 1} color={scanning ? theme.colors.primary : theme.colors.secondary} style={s.progressBar} />
-            <Text style={s.progressText}>{scanning ? `Scanning… ${Math.round(progress * 100)}%` : `Done — ${found.length} server${found.length !== 1 ? 's' : ''} found`}</Text>
-          </View>
-          <Divider style={{ backgroundColor: theme.colors.outline }} />
-        </>
+      {/* Progress */}
+      {scanning && (
+        <View style={s.progressContainer}>
+          <ProgressBar
+            progress={progress}
+            color={theme.colors.primary}
+            style={s.progressBar}
+          />
+          <Text style={s.progressText}>
+            Scansione in corso… {Math.round(progress * 100)}% — {found.length} trovati
+          </Text>
+        </View>
       )}
 
-      {hasScanned && found.length === 0 && !scanning ? (
+      <Divider style={{ backgroundColor: theme.colors.outline }} />
+
+      {/* Risultati */}
+      {found.length === 0 && !scanning ? (
         <View style={s.empty}>
           <Text style={s.emptyIcon}>🔍</Text>
-          <Text style={s.emptyTitle}>No servers found</Text>
-          <Text style={s.emptySubtitle}>Make sure Veyon is running{'\n'}and the IP range is correct</Text>
+          <Text style={s.emptyTitle}>Nessun server trovato</Text>
+          <Text style={s.emptySubtitle}>
+            Avvia una scansione per trovare{'\n'}i server Veyon sulla rete
+          </Text>
         </View>
       ) : (
         <FlatList
           data={found}
-          keyExtractor={(item) => item.ip}
+          keyExtractor={(item) => item.host}
           contentContainerStyle={s.list}
           renderItem={({ item }) => (
-            <TouchableOpacity style={s.row} onPress={() => toggleSelect(item.ip)}>
-              <Checkbox status={selected[item.ip] ? 'checked' : 'unchecked'} color={theme.colors.primary} onPress={() => toggleSelect(item.ip)} />
+            <TouchableOpacity style={s.row} onPress={() => toggleSelect(item.host)}>
+              <Checkbox
+                status={selected[item.host] ? 'checked' : 'unchecked'}
+                color={theme.colors.primary}
+                onPress={() => toggleSelect(item.host)}
+              />
               <View style={s.rowInfo}>
-                <Text style={s.rowIP}>{item.ip}</Text>
-                <Text style={s.rowMeta}>Port {item.port}</Text>
+                <Text style={s.rowHost}>{item.host}</Text>
+                <Text style={s.rowMeta}>Porta {item.port} · Veyon VNC</Text>
               </View>
-              <View style={[s.badge, { backgroundColor: extraColors.level3 }]}>
+              <View style={[s.badge, { backgroundColor: theme.colors.surfaceVariant }]}>
                 <Text style={[s.badgeText, { color: theme.colors.secondary }]}>VEYON</Text>
               </View>
             </TouchableOpacity>
@@ -118,10 +254,18 @@ const DiscoveryScreen = ({ navigation }) => {
         />
       )}
 
+      {/* Aggiungi button */}
       {found.length > 0 && (
         <View style={s.footer}>
-          <Button mode="contained" onPress={handleAddSelected} disabled={selectedCount === 0 || scanning || saving} loading={saving} style={s.addButton} contentStyle={s.addButtonContent}>
-            Add {selectedCount > 0 ? `${selectedCount} Computer${selectedCount > 1 ? 's' : ''}` : ''}
+          <Button
+            mode="contained"
+            onPress={handleAddSelected}
+            disabled={selectedCount === 0 || saving}
+            loading={saving}
+            style={s.addButton}
+            contentStyle={s.addButtonContent}
+          >
+            Aggiungi {selectedCount > 0 ? `${selectedCount} computer` : ''}
           </Button>
         </View>
       )}
@@ -133,19 +277,16 @@ const styles = (theme) => StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.colors.background },
   appbar: { backgroundColor: theme.colors.surface, elevation: 0, borderBottomWidth: 1, borderBottomColor: theme.colors.outline },
   appbarTitle: { fontSize: 18, fontWeight: '700', color: theme.colors.onSurface },
-  rangeContainer: { padding: 16, backgroundColor: theme.colors.surface, borderBottomWidth: 1, borderBottomColor: theme.colors.outline },
-  sectionLabel: { fontSize: 11, fontWeight: '700', color: theme.colors.onSurfaceVariant, letterSpacing: 1.2, marginBottom: 10 },
-  rangeRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
-  rangeInput: { flex: 1, backgroundColor: theme.colors.surfaceVariant },
-  rangeSeparator: { color: theme.colors.onSurfaceVariant, marginHorizontal: 8, fontSize: 18 },
-  scanButton: { borderRadius: 8 },
+  configSection: { padding: 16, backgroundColor: theme.colors.surface, borderBottomWidth: 1, borderBottomColor: theme.colors.outline },
+  input: { backgroundColor: theme.colors.surfaceVariant, marginBottom: 4 },
+  errorText: { color: theme.colors.error, fontSize: 12, marginTop: 4 },
   progressContainer: { padding: 16, backgroundColor: theme.colors.surface },
   progressBar: { height: 4, borderRadius: 2, backgroundColor: theme.colors.outline, marginBottom: 8 },
   progressText: { fontSize: 13, color: theme.colors.onSurfaceVariant },
   list: { paddingBottom: 100 },
   row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16, backgroundColor: theme.colors.surface },
   rowInfo: { flex: 1, marginLeft: 8 },
-  rowIP: { fontSize: 15, fontWeight: '600', color: theme.colors.onSurface },
+  rowHost: { fontSize: 15, fontWeight: '600', color: theme.colors.onSurface },
   rowMeta: { fontSize: 12, color: theme.colors.onSurfaceVariant, marginTop: 2 },
   badge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 4 },
   badgeText: { fontSize: 10, fontWeight: '700', letterSpacing: 0.8 },

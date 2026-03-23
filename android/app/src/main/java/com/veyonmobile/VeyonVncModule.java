@@ -6,14 +6,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
-import java.util.HashMap;
-import java.util.Map;
 
-/**
- * React Native module for VeyonVncClient.
- * Exposes connect/disconnect to JS.
- * Frame rendering is handled natively via VeyonSurfaceView.
- */
 public class VeyonVncModule extends ReactContextBaseJavaModule {
 
     private static final String MODULE_NAME = "VeyonVncModule";
@@ -27,7 +20,6 @@ public class VeyonVncModule extends ReactContextBaseJavaModule {
     @Override
     public String getName() { return MODULE_NAME; }
 
-    /** Called from VeyonSurfaceView to register itself */
     public static void registerSurface(VeyonSurfaceView surface) {
         activeSurface = surface;
     }
@@ -38,13 +30,28 @@ public class VeyonVncModule extends ReactContextBaseJavaModule {
             activeClient.disconnect();
             activeClient = null;
         }
+
+        // Retry fino a 10 volte con 100ms di intervallo (1 secondo totale)
+        // per aspettare che surfaceCreated venga chiamato
+        tryConnect(host, port, keyName, privateKey, promise, 10);
+    }
+
+    private void tryConnect(String host, int port, String keyName, String privateKey,
+                            Promise promise, int retriesLeft) {
         if (activeSurface == null) {
-            promise.reject("NO_SURFACE", "VeyonSurfaceView not mounted");
+            if (retriesLeft <= 0) {
+                promise.reject("NO_SURFACE", "VeyonSurfaceView not mounted after retries");
+                return;
+            }
+            // Riprova dopo 100ms
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() ->
+                            tryConnect(host, port, keyName, privateKey, promise, retriesLeft - 1),
+                    100
+            );
             return;
         }
 
         SurfaceHolder holder = activeSurface.getHolder();
-        ReactApplicationContext ctx = getReactApplicationContext();
 
         VeyonVncClient.Callback cb = new VeyonVncClient.Callback() {
             @Override
@@ -83,8 +90,8 @@ public class VeyonVncModule extends ReactContextBaseJavaModule {
     private void sendEvent(String eventName, String data) {
         try {
             getReactApplicationContext()
-                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                .emit(eventName, data);
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit(eventName, data);
         } catch (Exception ignored) {}
     }
 }
