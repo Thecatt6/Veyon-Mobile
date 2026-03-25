@@ -1,0 +1,44 @@
+name: React Native Android Build
+
+on:
+  workflow_dispatch: 
+  
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout del codice
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Installazione dipendenze JS
+        run: npm install
+
+      - name: Permessi per Gradle
+        run: chmod +x android/gradlew
+
+      - name: Build APK (Release)
+        run: |
+          cd android
+          npx react-native build-android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Caricamento Artifact (APK)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+
