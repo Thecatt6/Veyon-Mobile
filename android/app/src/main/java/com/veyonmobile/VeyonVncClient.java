@@ -28,6 +28,38 @@ public class VeyonVncClient {
 
     private static final String TAG = "VeyonVncClient";
 
+    // Byte counter for debugging
+    private static class ByteCounter extends java.io.FilterInputStream {
+        long count = 0;
+        ByteCounter(java.io.InputStream in) { super(in); }
+        @Override
+        public int read() throws IOException {
+            int b = super.read();
+            if (b >= 0) count++;
+            return b;
+        }
+        @Override
+        public int read(byte[] b) throws IOException {
+            int n = super.read(b);
+            if (n > 0) count += n;
+            return n;
+        }
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int n = super.read(b, off, len);
+            if (n > 0) count += n;
+            return n;
+        }
+        @Override
+        public long skip(long n) throws IOException {
+            long skipped = super.skip(n);
+            count += skipped;
+            return skipped;
+        }
+        void resetCount() { count = 0; }
+        long getCount() { return count; }
+    }
+
     private static final int SEC_TYPE_VEYON = 40;
     private static final int MSG_SET_PIXEL_FORMAT = 0;
     private static final int MSG_SET_ENCODINGS = 2;
@@ -40,8 +72,8 @@ public class VeyonVncClient {
     private static final int ENC_RRE = 2;
     private static final int ENC_CORRE = 4;
     private static final int ENC_HEXTILE = 5;
-    private static final int ENC_TIGHT = 7;
-    private static final int ENC_ZRLE = 16;
+    private static final int ENC_ZLIBHEX = 6;
+    private static final int ENC_ZLIB = 9;
     private static final int ENC_NEW_FB_SIZE = -223;
     private static final int ENC_LAST_RECT = -224;
     private static final int QMT_INT = 2;
@@ -53,9 +85,9 @@ public class VeyonVncClient {
             "SHA1withRSA",
             "NONEwithRSA"
     };
-    private static final int RECEIVE_LOOP_TIMEOUT_MS = 200;
-    private static final long KEEPALIVE_FRAMEBUFFER_MS = 200;
-    private static final long KEEPALIVE_MONITORING_PING_MS = 1000; // Ridotto per sicurezza
+    private static final int RECEIVE_LOOP_TIMEOUT_MS = 1000;
+    private static final long KEEPALIVE_FRAMEBUFFER_MS = 2000;
+    private static final long KEEPALIVE_MONITORING_PING_MS = 30000;
 
     public static final String FEATURE_MONITORING_MODE   = "edad8259-b4ef-4ca5-90e6-f238d0fda694";
     public static final String FEATURE_QUERY_APP_VERSION = "58f5d5d5-9929-48f4-a995-f221c150ae26";
@@ -80,6 +112,7 @@ public class VeyonVncClient {
 
     private Socket socket;
     private PushbackInputStream pbIn;
+    private ByteCounter byteCounter;
     private DataInputStream in;
     private DataOutputStream out;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -87,11 +120,12 @@ public class VeyonVncClient {
     private int fbWidth;
     private int fbHeight;
     private Bitmap framebuffer;
-    private final Inflater zrleInflater = new Inflater();
-    private final Inflater tightInflater = new Inflater();
     private volatile String protocolStep = "init";
     private volatile String activeSignatureAlgorithm = SIGNATURE_ALGORITHMS[0];
     private volatile boolean cleanRemoteClose = false;
+    private volatile boolean initialFrameReceived = false;
+    private volatile boolean initialFeaturesSent = false;
+    private volatile boolean firstFramebufferReceived = false;
 
     public interface Callback {
         void onConnected(int width, int height);
@@ -160,7 +194,7 @@ public class VeyonVncClient {
                                 (hasEofInChain(e) || hasSocketResetInChain(e));
                 if (remoteCloseDuringReceiveLoop) {
                     cleanRemoteClose = true;
-                    Log.i(TAG, "Server closed connection during receive loop");
+                    Log.i(TAG, "Server closed connection during receive loop", e);
                 } else {
                     String detailed = buildDetailedErrorMessage(e);
                     Log.e(TAG, "Connection error: " + detailed, e);
@@ -180,8 +214,9 @@ public class VeyonVncClient {
         socket = new Socket();
         socket.connect(new InetSocketAddress(host, port), 8000);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(10000);
-        pbIn = new PushbackInputStream(socket.getInputStream());
+        socket.setSoTimeout(10000); // 10 second timeout
+        byteCounter = new ByteCounter(socket.getInputStream());
+        pbIn = new PushbackInputStream(byteCounter, 16);
         in = new DataInputStream(pbIn);
         out = new DataOutputStream(socket.getOutputStream());
 
@@ -207,7 +242,12 @@ public class VeyonVncClient {
         Log.d(TAG, "Authentication successful (" + activeSignatureAlgorithm + ")");
 
         protocolStep = "client_init";
-        out.writeByte(1);
+        out.writeByte(1); // ClientInit
+        // Send a FBU request immediately so the proxy forwards it to UltraVNC
+        // as soon as the internal VNC connection is ready, preventing UltraVNC
+        // from timing out due to inactivity during the handshake phase.
+        // Use w=1,h=1 as a safe placeholder before we know the real framebuffer size.
+        sendFramebufferUpdateRequest(0, 0, 1, 1, false);
         out.flush();
 
         protocolStep = "server_init";
@@ -225,18 +265,27 @@ public class VeyonVncClient {
 
         sendSetPixelFormat();
         sendSetEncodings();
-        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, false);
+        out.flush();
 
-        // Attiva monitoring mode immediatamente
+        // Send ONLY monitoring mode feature message
+        // This tells the server we want to RECEIVE frames (monitoring mode)
         sendFeatureMessage(FEATURE_MONITORING_MODE, true, null);
-        // Richiedi metadati
-        sendFeatureMessage(FEATURE_QUERY_APP_VERSION, true, null);
-        sendFeatureMessage(FEATURE_QUERY_ACTIVE, true, null);
-        sendFeatureMessage(FEATURE_USER_INFO, true, null);
-        sendFeatureMessage(FEATURE_SESSION_INFO, true, null);
-        Log.d(TAG, "VNC session established; initial monitoring feature set sent");
+        out.flush();
+        
+        // Wait for server to process and activate monitoring
+        try { Thread.sleep(500); } catch (InterruptedException e) {}
+
+        // NOW send FBU requests to start receiving frames
+        for (int i = 0; i < 3; i++) {
+            sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, false);
+            out.flush();
+            try { Thread.sleep(50); } catch (InterruptedException e) {}
+        }
+
+        Log.d(TAG, "VNC session established; waiting for frames");
 
         protocolStep = "receive_loop";
+        Log.d(TAG, "Entering receive loop, available bytes: " + pbIn.available());
         receiveLoop();
     }
 
@@ -308,7 +357,7 @@ public class VeyonVncClient {
         Log.d(TAG, "Selected auth type: " + selectedType);
 
         // 2. Manda [authType, username] SENZA count
-        sendAuthTypeAndUsername(selectedType, "");
+        sendAuthTypeAndUsername(selectedType, "veyon-mobile");
         Log.d(TAG, "Auth type + username sent");
 
         // 3-4. Alcuni server inviano prima ACK vuoto (msgSize=0), altri inviano subito challenge.
@@ -465,30 +514,25 @@ public class VeyonVncClient {
         out.writeByte(0);  // little endian
         out.writeByte(1);  // true colour
         out.writeShort(255); out.writeShort(255); out.writeShort(255);
-        out.writeByte(16); out.writeByte(8); out.writeByte(0);
+        out.writeByte(16); out.writeByte(8); out.writeByte(0);  // RGB: red shift 16, green shift 8, blue shift 0
         out.writeByte(0); out.writeByte(0); out.writeByte(0);
         out.flush();
     }
 
     private void sendSetEncodings() throws IOException {
-        // ✅ CORRETTO: Ordine compatibile Veyon - TIGHT prima, ZRLE dopo
+        // Send ONLY RAW encoding - fastest for our Java decoder
+        // Veyon will use RAW which is simpler than Hextile
         int[] encodings = {
-                ENC_TIGHT,       // 7 - preferito da Veyon
-                ENC_ZRLE,        // 16
-                ENC_HEXTILE,     // 5
-                ENC_COPY_RECT,   // 1
-                ENC_RRE,         // 2
-                ENC_CORRE,       // 4
-                ENC_RAW,         // 0 - fallback sempre ultimo
-                ENC_NEW_FB_SIZE, // -223
-                ENC_LAST_RECT    // -224
+            0x00000000,  // RAW - simplest encoding
+            0x00000001,  // CopyRect
+            0xFFFFFFFA,  // DesktopSize
         };
         out.writeByte(MSG_SET_ENCODINGS);
         out.writeByte(0);
         out.writeShort(encodings.length);
         for (int enc : encodings) out.writeInt(enc);
         out.flush();
-        Log.d(TAG, "Sent encodings: TIGHT, ZRLE, HEXTILE, COPY_RECT, RRE, CORRE, RAW + pseudo");
+        Log.d(TAG, "Sent encodings: " + encodings.length + " entries (RAW only)");
     }
 
     private void sendFramebufferUpdateRequest(int x, int y, int w, int h, boolean incremental)
@@ -507,74 +551,134 @@ public class VeyonVncClient {
         long fpsTime = System.currentTimeMillis();
         long lastFramebufferRequestMs = System.currentTimeMillis();
         long lastMonitoringPingMs = System.currentTimeMillis();
-        socket.setSoTimeout(RECEIVE_LOOP_TIMEOUT_MS);
+
+        // Timeout più ragionevole: 1 secondo invece di 200ms
+        socket.setSoTimeout(1000); // Increased timeout to prevent premature disconnections
+
+        // Send an initial incremental FBU request to keep the connection alive
+        try {
+            sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+        } catch (IOException e) {
+            Log.w(TAG, "Failed to send initial FBU request: " + e.getMessage());
+        }
 
         while (running.get()) {
-            // Keep requesting updates proactively
-            long nowPreRead = System.currentTimeMillis();
-            if (nowPreRead - lastFramebufferRequestMs >= KEEPALIVE_FRAMEBUFFER_MS) {
-                sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                lastFramebufferRequestMs = nowPreRead;
-            }
-
             try {
+                Log.d(TAG, "Waiting for next message, available=" + pbIn.available());
+
+                // Peek ahead to log what's coming
+                if (pbIn.available() > 0) {
+                    byte[] peek = new byte[Math.min(16, pbIn.available())];
+                    int n = pbIn.read(peek);
+                    StringBuilder sb = new StringBuilder("Next bytes: ");
+                    for (int pi = 0; pi < n; pi++) sb.append(String.format("%02x ", peek[pi] & 0xFF));
+                    Log.d(TAG, sb.toString());
+                    pbIn.unread(peek, 0, n);
+                }
+
                 int msgType = in.readUnsignedByte();
-                Log.d(TAG, "Server msg type: 0x" + Integer.toHexString(msgType)); // Debug
-                
+                Log.d(TAG, "Server msg type: 0x" + Integer.toHexString(msgType));
+
                 switch (msgType) {
                     case MSG_SERVER_FRAMEBUFFER_UPDATE:
                         in.readUnsignedByte(); // padding
                         int numRects = in.readUnsignedShort();
+
+                        // VALIDAZIONE
+                        if (numRects < 0 || numRects > 100) {
+                            Log.e(TAG, "Invalid numRects: " + numRects + ", possible desync");
+                            throw new IOException("Invalid number of rectangles: " + numRects);
+                        }
+
                         Log.d(TAG, "Framebuffer update: " + numRects + " rectangles");
-                        for (int i = 0; i < numRects; i++) processRect();
+                        for (int i = 0; i < numRects; i++) {
+                            processRect();
+                        }
+
+                        // Send FBU request IMMEDIATELY after processing rects, BEFORE rendering
+                        // This keeps the pipeline full while we're slow Java rendering
+                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                        out.flush();
+
+                        // Renderizza (slow operation)
                         renderFrame();
                         fpsCount++;
-                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+
+                        if (!firstFramebufferReceived) {
+                            firstFramebufferReceived = true;
+                            Log.d(TAG, "First framebuffer received");
+                        }
+
                         lastFramebufferRequestMs = System.currentTimeMillis();
                         break;
+
                     case MSG_SERVER_BELL:
                         Log.d(TAG, "Bell received");
                         break;
+
                     case MSG_SERVER_CUT_TEXT:
+                        // Skip 3 bytes (padding)
                         in.readUnsignedByte(); in.readUnsignedByte(); in.readUnsignedByte();
                         int textLen = in.readInt();
                         byte[] text = new byte[textLen];
                         in.readFully(text);
-                        Log.d(TAG, "Cut text: " + textLen + " bytes");
+                        Log.d(TAG, "Server cut text: " + textLen + " bytes");
                         break;
-                    case 0x29: // Veyon FeatureMessage dal server
+
+                    case 0x29: // Veyon FeatureMessage
                         int fmSize = in.readInt();
-                        Log.d(TAG, "FeatureMessage received: " + fmSize + " bytes");
                         if (fmSize > 0 && fmSize < 65536) {
                             byte[] fmData = new byte[fmSize];
                             in.readFully(fmData);
-                            logFeatureMessageSummary(fmData);
+                            // Parse and respond to feature messages IMMEDIATELY
+                            handleFeatureMessage(fmData);
                         }
+                        // Send FBU requests IMMEDIATELY after feature message
+                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                        out.flush();
+                        lastFramebufferRequestMs = System.currentTimeMillis();
                         break;
+
                     default:
                         Log.w(TAG, "Unknown server message type: 0x" + Integer.toHexString(msgType));
+                        // Se il server invia un tipo sconosciuto, potrebbe essere un errore
+                        // o una desincronizzazione. Logghiamo e continuiamo.
                         break;
                 }
+
             } catch (SocketTimeoutException timeout) {
-                // Normale, continua il loop
+                // Send a keepalive FBU request to prevent server idle timeout
+                try {
+                    sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                } catch (IOException ignored) {}
             }
+            if (Thread.interrupted()) break;
 
             long now = System.currentTimeMillis();
-            if (now - lastFramebufferRequestMs >= KEEPALIVE_FRAMEBUFFER_MS) {
+
+            // KEEPALIVE: re-request frame every 200ms if server goes quiet
+            if (now - lastFramebufferRequestMs >= 200) {
                 sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                out.flush();
                 lastFramebufferRequestMs = now;
             }
+
+            // Keepalive monitoring (molto meno frequente)
             if (now - lastMonitoringPingMs >= KEEPALIVE_MONITORING_PING_MS) {
                 try {
+                    // Invia solo monitoring mode, non tutti i feature
                     sendFeatureMessage(FEATURE_MONITORING_MODE, true, null);
-                    // ✅ AGGIUNTO: Ping aggiuntivo per mantenere attiva la sessione
-                    sendFeatureMessage(FEATURE_QUERY_ACTIVE, true, null);
                 } catch (IOException e) {
-                    Log.w(TAG, "Monitoring ping send failed: " + e.getMessage());
+                    Log.w(TAG, "Monitoring ping failed: " + e.getMessage());
                 }
                 lastMonitoringPingMs = now;
             }
 
+            // FPS counter
             if (now - fpsTime >= 1000) {
                 callback.onFpsUpdate(fpsCount);
                 fpsCount = 0;
@@ -586,28 +690,75 @@ public class VeyonVncClient {
     // ─── Rectangle Processing ─────────────────────────────────────────────────
 
     private void processRect() throws IOException {
-        int x = in.readUnsignedShort(), y = in.readUnsignedShort();
-        int w = in.readUnsignedShort(), h = in.readUnsignedShort();
+        int x = in.readUnsignedShort();
+        int y = in.readUnsignedShort();
+        int w = in.readUnsignedShort();
+        int h = in.readUnsignedShort();
         int encoding = in.readInt();
-        Log.d(TAG, "Rect: " + x + "," + y + " " + w + "x" + h + " enc=" + encoding);
-        
+
+        // Pseudo-encodings (negative values or special values)
+        if (encoding == ENC_NEW_FB_SIZE) {
+            Log.d(TAG, "New framebuffer size: " + w + "x" + h);
+            return;
+        }
+        if (encoding == ENC_LAST_RECT) {
+            Log.d(TAG, "Last rect marker");
+            return;
+        }
+        // Cursor pseudo-encoding - skip the cursor data
+        if (encoding == -239 || encoding == 0xFFFF1710 || encoding == -306) {
+            // Cursor: w*h*4 bytes for colors + 2 bytes for hotspot x,y
+            int cursorSize = w * h * 4 + 4;
+            byte[] cursorData = new byte[cursorSize];
+            in.readFully(cursorData);
+            Log.d(TAG, "Cursor update skipped: " + w + "x" + h);
+            return;
+        }
+        // DesktopSize pseudo-encoding
+        if (encoding == -223 || encoding == 0xFFFF21) {
+            Log.d(TAG, "DesktopSize update: " + w + "x" + h);
+            return;
+        }
+        // QEMU extended key events
+        if (encoding == -259 || encoding == 0xFFFF23) {
+            Log.d(TAG, "QEMU extended keys skipped");
+            return;
+        }
+        // QEMU pointer motion change
+        if (encoding == -260 || encoding == 0xFFFF24) {
+            Log.d(TAG, "QEMU pointer motion skipped");
+            return;
+        }
+        // QEMU audio
+        if (encoding == -261 || encoding == 0xFFFF25) {
+            Log.d(TAG, "QEMU audio skipped");
+            return;
+        }
+        // Unknown pseudo-encoding - try to skip
+        if (encoding < 0 || encoding > 0x7FFFFFFF) {
+            Log.w(TAG, "Unknown pseudo-encoding: " + encoding + " skipping " + w + "x" + h);
+            // For pseudo-encodings, there's typically no rect data to skip
+            return;
+        }
+
+        // ✅ VALIDAZIONE: Se i valori sono assurdi, siamo desincronizzati
+        if (x > 10000 || y > 10000 || w > 5000 || h > 5000 || w < 0 || h < 0) {
+            Log.e(TAG, "Invalid rect values, protocol desync: x=" + x + " y=" + y + " w=" + w + " h=" + h + " enc=" + encoding);
+            throw new IOException("Protocol desynchronization detected");
+        }
+
         switch (encoding) {
-            case ENC_RAW:       processRawRect(x, y, w, h);  break;
-            case ENC_COPY_RECT: processCopyRect(x, y, w, h); break;
-            case ENC_ZRLE:      processZrleRect(x, y, w, h); break;
-            case ENC_TIGHT:     processTightRect(x, y, w, h); break; // ✅ AGGIUNTO
-            case ENC_HEXTILE:   processHexTileRect(x, y, w, h); break; // ✅ AGGIUNTO
-            case ENC_NEW_FB_SIZE: 
-                Log.d(TAG, "New framebuffer size: " + w + "x" + h);
-                // Ricrea framebuffer se necessario
-                break;
-            case ENC_LAST_RECT:
-                Log.d(TAG, "Last rect marker");
-                break;
-            default: 
-                Log.w(TAG, "Unsupported encoding: " + encoding);
-                // Salta i dati se possibile
-                break;
+            case ENC_RAW:       processRawRect(x, y, w, h);     break;
+            case ENC_COPY_RECT: processCopyRect(x, y, w, h);    break;
+            case ENC_RRE:       processRreRect(x, y, w, h);     break;
+            case ENC_CORRE:     processCorreRect(x, y, w, h);   break;
+            case ENC_HEXTILE:   processHexTileRect(x, y, w, h); break;
+            case ENC_ZLIB:      processZlibRect(x, y, w, h);    break;
+            case ENC_ZLIBHEX:   processZlibHexRect(x, y, w, h); break;
+            default:
+                Log.w(TAG, "Unsupported encoding: " + encoding + " — skipping rect " + w + "x" + h);
+                // For now, throw to reconnect - we can't safely skip unknown encodings
+                throw new IOException("Unsupported encoding: " + encoding);
         }
     }
 
@@ -618,6 +769,7 @@ public class VeyonVncClient {
             int g = in.readUnsignedByte();
             int b = in.readUnsignedByte();
             in.readUnsignedByte(); // padding
+            // Server sends in our negotiated RGB format
             pixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
         }
         if (framebuffer != null) {
@@ -637,166 +789,198 @@ public class VeyonVncClient {
         }
     }
 
-    // ✅ CORRETTO: Usa zrleInflater invece di tightInflater
-    private void processZrleRect(int x, int y, int w, int h) throws IOException {
+    private void processRreRect(int x, int y, int w, int h) throws IOException {
+        int numSubrects = in.readInt();
+        in.readUnsignedByte(); // padding
+        int bgR = in.readUnsignedByte(), bgG = in.readUnsignedByte(), bgB = in.readUnsignedByte();
+        in.readUnsignedByte(); // padding
+        // Server sends in our negotiated RGB format
+        int bg = 0xFF000000 | (bgR << 16) | (bgG << 8) | bgB;
+        int[] pixels = new int[w * h];
+        java.util.Arrays.fill(pixels, bg);
+        for (int i = 0; i < numSubrects; i++) {
+            in.readUnsignedByte(); // padding
+            int fgR = in.readUnsignedByte(), fgG = in.readUnsignedByte(), fgB = in.readUnsignedByte();
+            in.readUnsignedByte(); // padding
+            // Server sends in our negotiated RGB format
+            int fg = 0xFF000000 | (fgR << 16) | (fgG << 8) | fgB;
+            int sx = in.readUnsignedShort(), sy = in.readUnsignedShort();
+            int sw = in.readUnsignedShort(), sh = in.readUnsignedShort();
+            for (int row = sy; row < sy + sh; row++)
+                for (int col = sx; col < sx + sw; col++)
+                    if (row < h && col < w) pixels[row * w + col] = fg;
+        }
+        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+    }
+
+    private void processCorreRect(int x, int y, int w, int h) throws IOException {
+        int numSubrects = in.readInt();
+        in.readUnsignedByte(); // padding
+        int bgR = in.readUnsignedByte(), bgG = in.readUnsignedByte(), bgB = in.readUnsignedByte();
+        in.readUnsignedByte(); // padding
+        // Server sends in our negotiated RGB format
+        int bg = 0xFF000000 | (bgR << 16) | (bgG << 8) | bgB;
+        int[] pixels = new int[w * h];
+        java.util.Arrays.fill(pixels, bg);
+        for (int i = 0; i < numSubrects; i++) {
+            in.readUnsignedByte(); // padding
+            int fgR = in.readUnsignedByte(), fgG = in.readUnsignedByte(), fgB = in.readUnsignedByte();
+            in.readUnsignedByte(); // padding
+            // Server sends in our negotiated RGB format
+            int fg = 0xFF000000 | (fgR << 16) | (fgG << 8) | fgB;
+            int sx = in.readUnsignedByte(), sy = in.readUnsignedByte();
+            int sw = in.readUnsignedByte(), sh = in.readUnsignedByte();
+            for (int row = sy; row < sy + sh; row++)
+                for (int col = sx; col < sx + sw; col++)
+                    if (row < h && col < w) pixels[row * w + col] = fg;
+        }
+        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+    }
+
+    private void processHexTileRect(int x, int y, int w, int h) throws IOException {
+        int TILE = 16;
+        int tilesX = (w + TILE - 1) / TILE;
+        int tilesY = (h + TILE - 1) / TILE;
+        int totalTiles = tilesX * tilesY;
+        for (int ty = 0; ty < tilesY; ty++) {
+            for (int tx = 0; tx < tilesX; tx++) {
+                int tileX = x + tx * TILE;
+                int tileY = y + ty * TILE;
+                int tileW = Math.min(TILE, w - tx * TILE);
+                int tileH = Math.min(TILE, h - ty * TILE);
+                int subenc = in.readUnsignedByte();
+                processHexTileFromStream(in, tileX, tileY, tileW, tileH, subenc);
+            }
+        }
+    }
+
+    private final Inflater zlibInflater = new Inflater();
+
+    private void processZlibRect(int x, int y, int w, int h) throws IOException {
         int dataLen = in.readInt();
-        Log.d(TAG, "ZRLE rect: " + dataLen + " bytes compressed");
         byte[] compressed = new byte[dataLen];
         in.readFully(compressed);
-        
-        zrleInflater.reset();  // ✅ CORRETTO: usa zrleInflater
-        zrleInflater.setInput(compressed);
-        
-        int TILE = 64;
-        for (int ty = y; ty < y + h; ty += TILE) {
-            for (int tx = x; tx < x + w; tx += TILE) {
-                processZrleTile(tx, ty, Math.min(TILE, x + w - tx), Math.min(TILE, y + h - ty));
+        zlibInflater.setInput(compressed);
+        byte[] raw = new byte[w * h * 4];
+        try {
+            int total = 0;
+            while (total < raw.length) {
+                int r = zlibInflater.inflate(raw, total, raw.length - total);
+                if (r <= 0) break;
+                total += r;
             }
-        }
-    }
-
-    private void processZrleTile(int x, int y, int w, int h) throws IOException {
-        byte[] subbuf = new byte[1];
-        try { 
-            int result = zrleInflater.inflate(subbuf);  // ✅ CORRETTO: usa zrleInflater
-            if (result < 0) throw new IOException("Inflater error");
-        } catch (Exception e) { 
-            Log.e(TAG, "ZRLE tile inflate failed: " + e.getMessage());
-            return; 
-        }
-        int subenc = subbuf[0] & 0xFF;
+        } catch (Exception e) { throw new IOException("ZLIB inflate failed: " + e.getMessage()); }
         int[] pixels = new int[w * h];
-        
-        if (subenc == 0) {
-            // Raw
-            byte[] raw = new byte[w * h * 4];
-            try { 
-                int total = 0;
-                while (total < raw.length) {
-                    int r = zrleInflater.inflate(raw, total, raw.length - total);
-                    if (r <= 0) break;
-                    total += r;
-                }
-            } catch (Exception e) { 
-                Log.e(TAG, "ZRLE raw inflate failed: " + e.getMessage());
-                return; 
-            }
-            for (int i = 0; i < pixels.length; i++) {
-                pixels[i] = 0xFF000000
-                        | ((raw[i*4]   & 0xFF) << 16)
-                        | ((raw[i*4+1] & 0xFF) << 8)
-                        |  (raw[i*4+2] & 0xFF);
-            }
-        } else if (subenc == 1) {
-            // Solid color
-            byte[] color = new byte[3];
-            try { 
-                zrleInflater.inflate(color); 
-            } catch (Exception e) { 
-                Log.e(TAG, "ZRLE color inflate failed: " + e.getMessage());
-                return; 
-            }
-            int c = 0xFF000000
-                    | ((color[0] & 0xFF) << 16)
-                    | ((color[1] & 0xFF) << 8)
-                    |  (color[2] & 0xFF);
-            java.util.Arrays.fill(pixels, c);
-        } else {
-            Log.w(TAG, "ZRLE subencoding not implemented: " + subenc);
-            return;
-        }
-        
-        if (framebuffer != null) {
-            synchronized (framebuffer) {
-                framebuffer.setPixels(pixels, 0, w, x, y, w, h);
-            }
-        }
+        for (int i = 0; i < pixels.length; i++)
+            // Server sends RGBA pixels (4 bytes per pixel)
+            pixels[i] = 0xFF000000 | ((raw[i*4] & 0xFF) << 16) | ((raw[i*4+1] & 0xFF) << 8) | (raw[i*4+2] & 0xFF);
+        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
     }
 
-    // ✅ AGGIUNTO: Supporto TIGHT encoding (semplificato)
-    private void processTightRect(int x, int y, int w, int h) throws IOException {
-        int compressionControl = in.readUnsignedByte();
-        boolean fillBackground = (compressionControl & 0x80) != 0;
-        boolean jpegCompression = (compressionControl & 0x90) == 0x90;
-        
-        if (jpegCompression) {
-            // JPEG non supportato in questa implementazione base
-            Log.w(TAG, "TIGHT JPEG not supported, skipping");
-            return;
-        }
-        
-        if (fillBackground) {
-            // Solid fill
-            byte[] color = new byte[3];
-            in.readFully(color);
-            int c = 0xFF000000
-                    | ((color[0] & 0xFF) << 16)
-                    | ((color[1] & 0xFF) << 8)
-                    |  (color[2] & 0xFF);
-            int[] pixels = new int[w * h];
-            java.util.Arrays.fill(pixels, c);
-            synchronized (framebuffer) {
-                framebuffer.setPixels(pixels, 0, w, x, y, w, h);
-            }
-        } else {
-            // Basic compression - leggi lunghezza e dati compressi
-            int dataLen = readTightDataLength();
-            if (dataLen > 0) {
-                byte[] compressed = new byte[dataLen];
-                in.readFully(compressed);
-                // Decompressione TIGHT richiede implementazione completa
-                Log.d(TAG, "TIGHT basic: " + dataLen + " bytes (simplified handling)");
-            }
-        }
-    }
-
-    private int readTightDataLength() throws IOException {
-        int len = in.readUnsignedByte();
-        if ((len & 0x80) == 0) return len;
-        
-        len = (len & 0x7F) | (in.readUnsignedByte() << 7);
-        if ((len & 0x4000) == 0) return len & 0x3FFF;
-        
-        len = (len & 0x3FFF) | (in.readUnsignedByte() << 14);
-        return len & 0x7FFFFF;
-    }
-
-    // ✅ AGGIUNTO: Supporto HEXTILE encoding (semplificato)
-    private void processHexTileRect(int x, int y, int w, int h) throws IOException {
+    private void processZlibHexRect(int x, int y, int w, int h) throws IOException {
+        // ZlibHex: each 16x16 tile has a 1-byte subencoding; if bit 0x10 set, tile is zlib-compressed
         int TILE = 16;
         for (int ty = y; ty < y + h; ty += TILE) {
             for (int tx = x; tx < x + w; tx += TILE) {
                 int tileW = Math.min(TILE, x + w - tx);
                 int tileH = Math.min(TILE, y + h - ty);
-                processHexTile(tx, ty, tileW, tileH);
+                processZlibHexTile(tx, ty, tileW, tileH);
             }
         }
     }
 
-    private void processHexTile(int x, int y, int w, int h) throws IOException {
+    private void processZlibHexTile(int x, int y, int w, int h) throws IOException {
         int subenc = in.readUnsignedByte();
-        
+        boolean zlibEncoded = (subenc & 0x10) != 0;
+        int hextileSubenc = subenc & 0x0F;
+        if (zlibEncoded) {
+            // Read zlib-compressed hextile data
+            int dataLen = in.readUnsignedShort();
+            byte[] compressed = new byte[dataLen];
+            in.readFully(compressed);
+            // Decompress and process as raw hextile — simplified: treat as raw
+            Inflater inf = new Inflater();
+            inf.setInput(compressed);
+            byte[] raw = new byte[w * h * 4 + 16];
+            int total = 0;
+            try { while (total < raw.length) { int r = inf.inflate(raw, total, raw.length - total); if (r <= 0) break; total += r; } }
+            catch (Exception e) { throw new IOException("ZlibHex inflate failed"); }
+            // Parse as hextile from the decompressed buffer
+            java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.ByteArrayInputStream(raw, 0, total));
+            processHexTileFromStream(dis, x, y, w, h, hextileSubenc);
+        } else {
+            processHexTileFromStream(in, x, y, w, h, hextileSubenc);
+        }
+    }
+
+    private int hextileBg = 0xFF000000, hextileFg = 0xFFFFFFFF;
+
+    private void processHexTileFromStream(DataInputStream src, int x, int y, int w, int h, int subenc) throws IOException {
         boolean raw = (subenc & 1) != 0;
-        boolean backgroundSpecified = (subenc & 2) != 0;
-        boolean foregroundSpecified = (subenc & 4) != 0;
+        boolean bgSpec = (subenc & 2) != 0;
+        boolean fgSpec = (subenc & 4) != 0;
         boolean anySubrects = (subenc & 8) != 0;
         boolean subrectsColored = (subenc & 16) != 0;
         
-        // Per semplicità, gestisci solo raw in questa implementazione base
+        int[] pixels = new int[w * h];
         if (raw) {
-            int[] pixels = new int[w * h];
+            // Raw hextile: 4 bytes per pixel (R, G, B, padding) - Veyon uses bytesPerPixel=4
             for (int i = 0; i < pixels.length; i++) {
-                int r = in.readUnsignedByte();
-                int g = in.readUnsignedByte();
-                int b = in.readUnsignedByte();
+                int r = src.readUnsignedByte();
+                int g = src.readUnsignedByte();
+                int b = src.readUnsignedByte();
+                src.readUnsignedByte(); // padding
                 pixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
             }
-            synchronized (framebuffer) {
-                framebuffer.setPixels(pixels, 0, w, x, y, w, h);
-            }
         } else {
-            Log.d(TAG, "HEXTILE encoded tile (simplified handling)");
+            // Background color if specified (4 bytes: R, G, B, padding)
+            if (bgSpec) {
+                int r = src.readUnsignedByte();
+                int g = src.readUnsignedByte();
+                int b = src.readUnsignedByte();
+                src.readUnsignedByte(); // padding
+                hextileBg = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+            // Foreground color if specified (4 bytes: R, G, B, padding)
+            if (fgSpec) {
+                int r = src.readUnsignedByte();
+                int g = src.readUnsignedByte();
+                int b = src.readUnsignedByte();
+                src.readUnsignedByte(); // padding
+                hextileFg = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+            // Fill with background
+            java.util.Arrays.fill(pixels, hextileBg);
+            // Subrectangles
+            if (anySubrects) {
+                int nSubrects = src.readUnsignedByte();
+                for (int i = 0; i < nSubrects; i++) {
+                    int color = hextileFg;
+                    if (subrectsColored) {
+                        // Colored subrect: 4 bytes (R, G, B, padding)
+                        int r = src.readUnsignedByte();
+                        int g = src.readUnsignedByte();
+                        int b = src.readUnsignedByte();
+                        src.readUnsignedByte(); // padding
+                        color = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    }
+                    // xy: packed (x<<4)|y
+                    int xy = src.readUnsignedByte();
+                    // wh: packed ((w-1)<<4)|(h-1)
+                    int wh = src.readUnsignedByte();
+                    int sx = (xy >> 4) & 0xF;
+                    int sy = xy & 0xF;
+                    int sw = ((wh >> 4) & 0xF) + 1;
+                    int sh = (wh & 0xF) + 1;
+                    for (int row = sy; row < sy + sh && row < h; row++) {
+                        for (int col = sx; col < sx + sw && col < w; col++) {
+                            pixels[row * w + col] = color;
+                        }
+                    }
+                }
+            }
         }
+        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
     }
 
     // ─── Render ────────────────────────────────────────────────────────────────
@@ -820,22 +1004,247 @@ public class VeyonVncClient {
 
     // ─── Feature Messages ──────────────────────────────────────────────────────
 
+    private void handleFeatureMessage(byte[] fmData) throws IOException {
+        try {
+            java.io.DataInputStream dis = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(fmData));
+            
+            // Read feature UID
+            int uidType = dis.readInt();
+            dis.readUnsignedByte(); // isNull
+            long data1 = dis.readInt();
+            int data2 = dis.readUnsignedShort();
+            int data3 = dis.readUnsignedShort();
+            byte[] data4 = new byte[8];
+            dis.readFully(data4);
+            
+            // Convert to UUID string
+            String featureUid = String.format("%08x-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x",
+                (int)data1, data2, data3,
+                data4[0], data4[1], data4[2], data4[3],
+                data4[4], data4[5], data4[6], data4[7]);
+            
+            // Read command
+            int cmdType = dis.readInt();
+            dis.readUnsignedByte();
+            int command = dis.readInt();
+            
+            // Read arguments map
+            int mapType = dis.readInt();
+            dis.readUnsignedByte();
+            int mapCount = dis.readInt();
+            
+            Log.d(TAG, "FeatureMessage: uid=" + featureUid + " cmd=" + command + " args=" + mapCount);
+            
+            // Respond to MonitoringMode feature - this activates frame streaming
+            if (featureUid.equals(FEATURE_MONITORING_MODE)) {
+                Log.d(TAG, "Responding to MonitoringMode feature");
+                // Send back a simple acknowledgment with empty arguments
+                sendSimpleFeatureReply(featureUid, 0);
+            }
+            
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to handle feature message: " + e.getMessage());
+        }
+    }
+    
+    // Send a simple feature reply with just UUID and command (no arguments)
+    private void sendSimpleFeatureReply(String featureUid, int command) throws IOException {
+        if (out == null) return;
+        
+        // Convert UUID to bytes
+        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
+        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
+        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
+        byte[] data4 = new byte[8];
+        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
+        for (int i = 0; i < 8; i++) {
+            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        
+        // payloadSize = UUID(21) + Command(9) + EmptyMap(9) = 39 bytes
+        int payloadSize = 39;
+        
+        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        
+        buf.putInt(payloadSize);
+        
+        // UUID - type=30, isNull=0, 16 bytes
+        buf.putInt(30);
+        buf.put((byte) 0);
+        buf.putInt((int) data1);
+        buf.putShort((short) data2);
+        buf.putShort((short) data3);
+        buf.put(data4);
+        
+        // Command - type=2, isNull=0, value
+        buf.putInt(QMT_INT);
+        buf.put((byte) 0);
+        buf.putInt(command);
+        
+        // Empty arguments map - type=8, isNull=0, count=0
+        buf.putInt(8);
+        buf.put((byte) 0);
+        buf.putInt(0);
+        
+        out.write(buf.array());
+        out.flush();
+        Log.d(TAG, "Sent simple feature reply: " + featureUid + " cmd=" + command);
+    }
+    
+    private void sendFeatureMessageReply(String featureUid, int command, Object... args) throws IOException {
+        if (out == null) return;
+        if (args.length % 2 != 0 && args.length != 0) {
+            Log.w(TAG, "sendFeatureMessageReply: args must be even count");
+            return;
+        }
+        
+        // Convert UUID to bytes
+        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
+        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
+        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
+        byte[] data4 = new byte[8];
+        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
+        for (int i = 0; i < 8; i++) {
+            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        
+        // Build arguments map
+        java.util.Map<String, Object> arguments = new java.util.HashMap<>();
+        for (int i = 0; i < args.length; i += 2) {
+            arguments.put((String)args[i], args[i+1]);
+        }
+        
+        // Calculate payload size
+        int uuidSize = 21;
+        int cmdSize = 9;
+        int mapSize = 9; // type + isNull + count
+        for (java.util.Map.Entry<String, Object> entry : arguments.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof String) {
+                String s = (String) value;
+                mapSize += 9 + s.length() * 2;
+            } else if (value instanceof java.util.List) {
+                mapSize += 9 + 9;
+            } else if (value instanceof java.util.Map) {
+                mapSize += 9 + 9;
+            }
+        }
+        
+        int payloadSize = uuidSize + cmdSize + mapSize;
+        
+        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        
+        buf.putInt(payloadSize);
+        
+        // UUID
+        buf.putInt(30);
+        buf.put((byte) 0);
+        buf.putInt((int) data1);
+        buf.putShort((short) data2);
+        buf.putShort((short) data3);
+        buf.put(data4);
+        
+        // Command
+        buf.putInt(QMT_INT);
+        buf.put((byte) 0);
+        buf.putInt(command);
+        
+        // Arguments map
+        buf.putInt(8);
+        buf.put((byte) 0);
+        buf.putInt(arguments.size());
+        
+        for (java.util.Map.Entry<String, Object> entry : arguments.entrySet()) {
+            // Key as QString
+            String key = entry.getKey();
+            byte[] keyUtf16 = key.getBytes("UTF-16BE");
+            buf.putInt(10);
+            buf.put((byte) 0);
+            buf.putInt(keyUtf16.length);
+            buf.put(keyUtf16);
+            
+            // Value
+            Object value = entry.getValue();
+            if (value instanceof String) {
+                String s = (String) value;
+                byte[] valUtf16 = s.getBytes("UTF-16BE");
+                buf.putInt(10);
+                buf.put((byte) 0);
+                buf.putInt(valUtf16.length);
+                buf.put(valUtf16);
+            } else if (value instanceof java.util.List) {
+                java.util.List<?> list = (java.util.List<?>) value;
+                buf.putInt(10);
+                buf.put((byte) 0);
+                buf.putInt(list.size() * 20);
+                for (Object item : list) {
+                    if (item instanceof java.util.Map) {
+                        java.util.Map<?, ?> map = (java.util.Map<?, ?>) item;
+                        buf.putInt(8);
+                        buf.put((byte) 0);
+                        buf.putInt(map.size());
+                        for (java.util.Map.Entry<?, ?> e : map.entrySet()) {
+                            String k = e.getKey().toString();
+                            byte[] kUtf16 = k.getBytes("UTF-16BE");
+                            buf.putInt(10);
+                            buf.put((byte) 0);
+                            buf.putInt(kUtf16.length);
+                            buf.put(kUtf16);
+                            String v = e.getValue().toString();
+                            byte[] vUtf16 = v.getBytes("UTF-16BE");
+                            buf.putInt(10);
+                            buf.put((byte) 0);
+                            buf.putInt(vUtf16.length);
+                            buf.put(vUtf16);
+                        }
+                    }
+                }
+            } else if (value instanceof java.util.Map) {
+                java.util.Map<?, ?> map = (java.util.Map<?, ?>) value;
+                buf.putInt(8);
+                buf.put((byte) 0);
+                buf.putInt(map.size());
+                for (java.util.Map.Entry<?, ?> e : map.entrySet()) {
+                    String k = e.getKey().toString();
+                    byte[] kUtf16 = k.getBytes("UTF-16BE");
+                    buf.putInt(10);
+                    buf.put((byte) 0);
+                    buf.putInt(kUtf16.length);
+                    buf.put(kUtf16);
+                    String v = e.getValue().toString();
+                    byte[] vUtf16 = v.getBytes("UTF-16BE");
+                    buf.putInt(10);
+                    buf.put((byte) 0);
+                    buf.putInt(vUtf16.length);
+                    buf.put(vUtf16);
+                }
+            }
+        }
+        
+        out.write(buf.array());
+        out.flush();
+        Log.d(TAG, "Sent feature reply: " + featureUid + " cmd=" + command);
+    }
+
     public synchronized void sendFeatureMessage(String featureUid, boolean active,
                                                 java.util.Map<String, String> arguments)
             throws IOException {
         if (out == null) return;
 
-        // Converti UUID string → 16 bytes binari Qt
-        String stripped = featureUid.replace("-", "");
+        // Convert UUID string to 16 bytes (big-endian RFC 4122 format)
         long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
-        int  data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
-        int  data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
+        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
+        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
         byte[] data4 = new byte[8];
         String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
         for (int i = 0; i < 8; i++) {
             data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
         }
 
+        // payloadSize = UUID(21) + Command(9) + Map(9) = 39 bytes
         int payloadSize = 21 + 9 + 9;
 
         ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
@@ -844,7 +1253,7 @@ public class VeyonVncClient {
         buf.put((byte) MSG_VEYON_FEATURE);
         buf.putInt(payloadSize);
 
-        // QVariant<QUuid>
+        // QVariant<QUuid> - type=30, isNull=0, then 16 bytes
         buf.putInt(30);
         buf.put((byte) 0);
         buf.putInt((int) data1);
@@ -852,19 +1261,19 @@ public class VeyonVncClient {
         buf.putShort((short) data3);
         buf.put(data4);
 
-        // QVariant<Int>
+        // QVariant<Int> Command - use Command::Default = 0
         buf.putInt(QMT_INT);
         buf.put((byte) 0);
-        buf.putInt(active ? 0 : 1);
+        buf.putInt(0);
 
-        // QVariant<QVariantMap>
+        // QVariant<QVariantMap> - type=8, isNull=0, count=0
         buf.putInt(8);
         buf.put((byte) 0);
         buf.putInt(0);
 
         out.write(buf.array());
         out.flush();
-        Log.d(TAG, "Sent feature: " + featureUid + " active=" + active);
+        Log.d(TAG, "Sent feature: " + featureUid);
     }
 
     // ─── Utility ───────────────────────────────────────────────────────────────

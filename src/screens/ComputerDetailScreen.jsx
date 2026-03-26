@@ -201,11 +201,21 @@ const ComputerDetailScreen = ({ route, navigation }) => {
 
     if (keyList.length === 0) { setStatus('no-auth'); return; }
 
-    // VNC mode: salta completamente la WebAPI, vai diretto allo stream VNC
+    // VNC mode: use VNC for display but still auth with WebAPI for features
     if (method === 'vnc') {
-      // Carica la chiave per passarla a VeyonVncView
+      // Load the key for VeyonVncView
       if (keyList.length > 0) {
         authKeyRef.current = { keyName: keyList[0].keyName, privateKey: keyList[0].privateKey };
+      }
+      // Also try WebAPI auth for features (non-blocking)
+      for (const key of keyList) {
+        try {
+          const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
+          if (!mountedRef.current) return;
+          sessionRef.current = session;
+          setTimeout(() => loadFeatures(session.connectionUid), 800);
+          break;
+        } catch (e) { console.log('WebAPI auth (optional):', e?.message); }
       }
       if (mountedRef.current) setStatus('live');
       return;
@@ -364,9 +374,12 @@ const ComputerDetailScreen = ({ route, navigation }) => {
             {fps} FPS · {RENDERER_LABELS[renderer]}
           </Chip>
         )}
-        {features.length > 0 && (
-          <Appbar.Action icon="lightning-bolt" iconColor={theme.colors.primary} onPress={() => setActionsVisible(true)} />
-        )}
+        <Appbar.Action
+          icon="lightning-bolt"
+          iconColor={features.length > 0 ? theme.colors.primary : theme.colors.onSurfaceVariant}
+          onPress={() => setActionsVisible(true)}
+          disabled={features.length === 0}
+        />
       </Appbar.Header>
 
       {/* Framebuffer */}
@@ -397,26 +410,34 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           </Dialog.Title>
           <Dialog.ScrollArea style={{ maxHeight: 440 }}>
             <ScrollView contentContainerStyle={{ padding: 8 }}>
-              <View style={s.actionsGrid}>
-                {features.map((feature) => {
-                  const meta = getMeta(feature);
-                  const isActive = meta.toggle && feature.active;
-                  return (
-                    <Button
-                      key={feature.uid}
-                      mode={isActive ? 'contained' : 'outlined'}
-                      style={[s.actionButton, meta.notSupported && { opacity: 0.5 }]}
-                      labelStyle={s.actionLabel}
-                      loading={loadingFeature === feature.uid}
-                      disabled={loadingFeature !== null}
-                      onPress={() => { setActionsVisible(false); setTimeout(() => handleFeaturePress(feature), 150); }}
-                      compact
-                    >
-                      {meta.label}
-                    </Button>
-                  );
-                })}
-              </View>
+              {features.length === 0 ? (
+                <View style={{ padding: 24, alignItems: 'center' }}>
+                  <Text style={{ color: theme.colors.onSurfaceVariant, textAlign: 'center' }}>
+                    No features available.{'\n'}Make sure the Veyon service is running on the remote computer.
+                  </Text>
+                </View>
+              ) : (
+                <View style={s.actionsGrid}>
+                  {features.map((feature) => {
+                    const meta = getMeta(feature);
+                    const isActive = meta.toggle && feature.active;
+                    return (
+                      <Button
+                        key={feature.uid}
+                        mode={isActive ? 'contained' : 'outlined'}
+                        style={[s.actionButton, meta.notSupported && { opacity: 0.5 }]}
+                        labelStyle={s.actionLabel}
+                        loading={loadingFeature === feature.uid}
+                        disabled={loadingFeature !== null}
+                        onPress={() => { setActionsVisible(false); setTimeout(() => handleFeaturePress(feature), 150); }}
+                        compact
+                      >
+                        {meta.label}
+                      </Button>
+                    );
+                  })}
+                </View>
+              )}
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
