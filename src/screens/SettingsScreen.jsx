@@ -168,6 +168,50 @@ const SettingsScreen = ({ navigation }) => {
 
         <Divider style={s.divider} />
 
+        {/* ── Feature Execution ──────────────────────────────────────────── */}
+        <Text style={s.sectionLabel}>FEATURE EXECUTION</Text>
+        <View style={s.card}>
+          <Text style={s.settingTitle}>Execute features via</Text>
+          <Text style={s.settingDesc}>
+            WebAPI: HTTP requests (requires WebAPI plugin).{'\n'}
+            VNC: Native Veyon protocol (always works).
+          </Text>
+          <SegmentedButtons
+            value={settings.featureMethod || 'webapi'}
+            onValueChange={(v) => update('featureMethod', v)}
+            density="small"
+            style={{ marginTop: 12 }}
+            buttons={[
+              { value: 'webapi', label: '🌐 WebAPI', icon: 'web' },
+              { value: 'vnc',    label: '🖥️ VNC',     icon: 'lightning-bolt' },
+            ]}
+          />
+        </View>
+
+        <Divider style={s.divider} />
+
+        {/* ── Preview Method ─────────────────────────────────────────────── */}
+        <Text style={s.sectionLabel}>PREVIEW METHOD</Text>
+        <View style={s.card}>
+          <Text style={s.settingTitle}>Home screen preview</Text>
+          <Text style={s.settingDesc}>
+            WebAPI: MJPEG stream (lower quality).{'\n'}
+            VNC: Full VNC connection (better quality).
+          </Text>
+          <SegmentedButtons
+            value={settings.previewMethod || 'webapi'}
+            onValueChange={(v) => update('previewMethod', v)}
+            density="small"
+            style={{ marginTop: 12 }}
+            buttons={[
+              { value: 'webapi', label: '🌐 WebAPI', icon: 'web' },
+              { value: 'vnc',    label: '🖥️ VNC',    icon: 'image' },
+            ]}
+          />
+        </View>
+
+        <Divider style={s.divider} />
+
         {/* ── Info ────────────────────────────────────────────────────────── */}
         <Text style={s.sectionLabel}>INFO</Text>
         <View style={s.card}>
@@ -175,6 +219,18 @@ const SettingsScreen = ({ navigation }) => {
             <Text style={[s.settingTitle, { flex: 1 }]}>Connection method</Text>
             <Text style={[s.settingDesc, { color: theme.colors.primary }]}>
               {settings.connectionMethod === 'webapi' ? `WebAPI :${settings.webApiPort}` : `VNC :${settings.vncPort}`}
+            </Text>
+          </View>
+          <View style={[s.row, { marginTop: 8 }]}>
+            <Text style={[s.settingTitle, { flex: 1 }]}>Features via</Text>
+            <Text style={[s.settingDesc, { color: theme.colors.primary }]}>
+              {settings.featureMethod || 'webapi'}
+            </Text>
+          </View>
+          <View style={[s.row, { marginTop: 8 }]}>
+            <Text style={[s.settingTitle, { flex: 1 }]}>Preview via</Text>
+            <Text style={[s.settingDesc, { color: theme.colors.primary }]}>
+              {settings.previewMethod || 'webapi'}
             </Text>
           </View>
           <View style={[s.row, { marginTop: 8 }]}>

@@ -3,9 +3,11 @@ import { View, FlatList, StyleSheet, TouchableOpacity } from 'react-native';
 import { FAB, Portal, useTheme, Text, Appbar, Dialog, Button, Checkbox, ActivityIndicator } from 'react-native-paper';
 import { useFocusEffect } from '@react-navigation/native';
 import ComputerCard from '../components/ComputerCard';
-import { getComputers, deleteComputer } from '../controllers/StorageController';
+import { getComputers, deleteComputer, getSettings } from '../controllers/StorageController';
 import { getAuthKeys } from '../controllers/StorageController';
 import { authenticate, getFeatures, setFeature } from '../controllers/VeyonAPI';
+import { NativeModules } from 'react-native';
+const { VeyonVncModule } = NativeModules;
 
 // Feature labels (stesso mapping di ComputerDetailScreen)
 const FEATURE_LABELS = {
@@ -117,33 +119,44 @@ const HomeScreen = ({ navigation }) => {
     setBroadcastDialogVisible(true);
 
     try {
+      const settings = await getSettings();
+      const featureMethod = settings.featureMethod || 'webapi';
       const keys = await getAuthKeys();
       const keyList = Object.values(keys);
       if (keyList.length === 0) { setBroadcastLoading(false); return; }
 
-      // Fetch features from all selected computers
-      const allFeatureSets = await Promise.all(
-        selectedComputers.map(async (computer) => {
-          for (const key of keyList) {
-            try {
-              const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
-              const data = await getFeatures(`http://${computer.ip}:${computer.port}`, session.connectionUid);
-              const list = Array.isArray(data) ? data : (data?.features || data?.data || []);
-              return list;
-            } catch { /* try next key */ }
-          }
-          return [];
-        })
-      );
+      if (featureMethod === 'vnc') {
+        // For VNC, show predefined feature list (no need to fetch from server)
+        const commonFeatures = Object.keys(FEATURE_LABELS).map(name => ({ name, uid: name }));
+        setBroadcastFeatures(commonFeatures.filter((f) => !HIDDEN_FEATURES.has(f.name)));
+      } else {
+        // Fetch features from all selected computers via WebAPI
+        const allFeatureSets = await Promise.all(
+          selectedComputers.map(async (computer) => {
+            for (const key of keyList) {
+              try {
+                const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
+                const data = await getFeatures(`http://${computer.ip}:${computer.port}`, session.connectionUid);
+                const list = Array.isArray(data) ? data : (data?.features || data?.data || []);
+                return list;
+              } catch { /* try next key */ }
+            }
+            return [];
+          })
+        );
 
-      // Find features common to all selected computers (by name)
-      const nameSets = allFeatureSets.map((fs) => new Set(fs.map((f) => f.name)));
-      const commonNames = nameSets.reduce((acc, s) => new Set([...acc].filter((n) => s.has(n))));
-      const commonFeatures = allFeatureSets[0]?.filter((f) => commonNames.has(f.name)) || [];
+        // Find features common to all selected computers (by name)
+        const nameSets = allFeatureSets.map((fs) => new Set(fs.map((f) => f.name)));
+        const commonNames = nameSets.reduce((acc, s) => new Set([...acc].filter((n) => s.has(n))));
+        const commonFeatures = allFeatureSets[0]?.filter((f) => commonNames.has(f.name)) || [];
 
-      setBroadcastFeatures(commonFeatures.filter((f) => !HIDDEN_FEATURES.has(f.name)));
+        setBroadcastFeatures(commonFeatures.filter((f) => !HIDDEN_FEATURES.has(f.name)));
+      }
     } catch (err) {
       console.warn('Broadcast feature fetch error:', err?.message);
+      // Fallback to predefined list on error
+      const commonFeatures = Object.keys(FEATURE_LABELS).map(name => ({ name, uid: name }));
+      setBroadcastFeatures(commonFeatures.filter((f) => !HIDDEN_FEATURES.has(f.name)));
     } finally {
       setBroadcastLoading(false);
     }
@@ -154,35 +167,54 @@ const HomeScreen = ({ navigation }) => {
     setBroadcastDialogVisible(false);
     setBroadcastLoading(true);
 
-    const keys = await getAuthKeys();
-    const keyList = Object.values(keys);
+    try {
+      const settings = await getSettings();
+      const featureMethod = settings.featureMethod || 'webapi';
+      const keys = await getAuthKeys();
+      const keyList = Object.values(keys);
 
-    const results = await Promise.allSettled(
-      selectedComputers.map(async (computer) => {
-        for (const key of keyList) {
-          try {
-            const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
-            const baseURL = `http://${computer.ip}:${computer.port}`;
-            const data = await getFeatures(baseURL, session.connectionUid);
-            const list = Array.isArray(data) ? data : (data?.features || data?.data || []);
-            const feature = list.find((f) => f.name === featureName);
-            if (feature) {
-              await setFeature(baseURL, session.connectionUid, feature.uid, true);
+      if (featureMethod === 'vnc') {
+        // Use VNC to send features
+        await Promise.allSettled(
+          selectedComputers.map(async (computer) => {
+            for (const key of keyList) {
+              try {
+                // Connect via VNC and send feature
+                await VeyonVncModule.connect(computer.ip, settings.vncPort || 11100, key.keyName, key.privateKey);
+                await VeyonVncModule.sendFeature(featureName, true, null);
+                await VeyonVncModule.disconnect();
+                return computer.ip;
+              } catch { /* try next key */ }
             }
-            return computer.ip;
-          } catch { /* try next key */ }
-        }
-        throw new Error(`Failed: ${computer.ip}`);
-      })
-    );
-
-    setBroadcastLoading(false);
-    exitSelectMode();
-
-    const failed = results.filter((r) => r.status === 'rejected').length;
-    if (failed > 0) {
-      // Simple feedback — could use a snackbar
-      console.warn(`Broadcast: ${failed} failed out of ${selectedCount}`);
+            throw new Error(`Failed: ${computer.ip}`);
+          })
+        );
+      } else {
+        // Use WebAPI to send features
+        const results = await Promise.allSettled(
+          selectedComputers.map(async (computer) => {
+            for (const key of keyList) {
+              try {
+                const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
+                const baseURL = `http://${computer.ip}:${computer.port}`;
+                const data = await getFeatures(baseURL, session.connectionUid);
+                const list = Array.isArray(data) ? data : (data?.features || data?.data || []);
+                const feature = list.find((f) => f.name === featureName);
+                if (feature) {
+                  await setFeature(baseURL, session.connectionUid, feature.uid, true);
+                }
+                return computer.ip;
+              } catch { /* try next key */ }
+            }
+            throw new Error(`Failed: ${computer.ip}`);
+          })
+        );
+      }
+    } catch (err) {
+      console.warn('Broadcast action error:', err?.message);
+    } finally {
+      setBroadcastLoading(false);
+      exitSelectMode();
     }
   };
 

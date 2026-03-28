@@ -14,6 +14,8 @@ const DEFAULT_SETTINGS = {
   vncPort: 11100,
   webApiPort: 11080,
   frameThrottleMs: 100,       // ms tra un frame e il prossimo (0 = max speed)
+  featureMethod: 'webapi',
+  previewMethod: 'webapi'<
 };
 
 async function getSettings() {

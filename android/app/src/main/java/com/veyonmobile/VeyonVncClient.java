@@ -28,38 +28,6 @@ public class VeyonVncClient {
 
     private static final String TAG = "VeyonVncClient";
 
-    // Byte counter for debugging
-    private static class ByteCounter extends java.io.FilterInputStream {
-        long count = 0;
-        ByteCounter(java.io.InputStream in) { super(in); }
-        @Override
-        public int read() throws IOException {
-            int b = super.read();
-            if (b >= 0) count++;
-            return b;
-        }
-        @Override
-        public int read(byte[] b) throws IOException {
-            int n = super.read(b);
-            if (n > 0) count += n;
-            return n;
-        }
-        @Override
-        public int read(byte[] b, int off, int len) throws IOException {
-            int n = super.read(b, off, len);
-            if (n > 0) count += n;
-            return n;
-        }
-        @Override
-        public long skip(long n) throws IOException {
-            long skipped = super.skip(n);
-            count += skipped;
-            return skipped;
-        }
-        void resetCount() { count = 0; }
-        long getCount() { return count; }
-    }
-
     private static final int SEC_TYPE_VEYON = 40;
     private static final int MSG_SET_PIXEL_FORMAT = 0;
     private static final int MSG_SET_ENCODINGS = 2;
@@ -72,22 +40,18 @@ public class VeyonVncClient {
     private static final int ENC_RRE = 2;
     private static final int ENC_CORRE = 4;
     private static final int ENC_HEXTILE = 5;
-    private static final int ENC_ZLIBHEX = 6;
     private static final int ENC_ZLIB = 9;
-    private static final int ENC_NEW_FB_SIZE = -223;
-    private static final int ENC_LAST_RECT = -224;
     private static final int QMT_INT = 2;
+    private static final int QMT_MAP = 8;
+    private static final int QMT_STRING = 10;
+    private static final int QMT_UUID = 30;
     private static final int QMT_BYTEARRAY = 12;
     private static final int MSG_VEYON_FEATURE = 0x29;
-    private static final String[] SIGNATURE_ALGORITHMS = new String[] {
-            "SHA512withRSA",
-            "SHA256withRSA",
-            "SHA1withRSA",
-            "NONEwithRSA"
-    };
-    private static final int RECEIVE_LOOP_TIMEOUT_MS = 1000;
-    private static final long KEEPALIVE_FRAMEBUFFER_MS = 2000;
     private static final long KEEPALIVE_MONITORING_PING_MS = 30000;
+
+    private static final String[] SIGNATURE_ALGORITHMS = {
+            "SHA512withRSA", "SHA256withRSA", "SHA1withRSA", "NONEwithRSA"
+    };
 
     public static final String FEATURE_MONITORING_MODE   = "edad8259-b4ef-4ca5-90e6-f238d0fda694";
     public static final String FEATURE_QUERY_APP_VERSION = "58f5d5d5-9929-48f4-a995-f221c150ae26";
@@ -113,7 +77,6 @@ public class VeyonVncClient {
 
     private Socket socket;
     private PushbackInputStream pbIn;
-    private ByteCounter byteCounter;
     private DataInputStream in;
     private DataOutputStream out;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -121,14 +84,14 @@ public class VeyonVncClient {
     private int fbWidth;
     private int fbHeight;
     private Bitmap framebuffer;
+    private int[] pixelBuffer; // Reusable buffer to reduce GC pressure
+    private byte[] rowBuffer;  // Row buffer for pixel reading
     private volatile String protocolStep = "init";
     private volatile String activeSignatureAlgorithm = SIGNATURE_ALGORITHMS[0];
     private volatile boolean cleanRemoteClose = false;
-    private volatile boolean initialFrameReceived = false;
-    private volatile boolean initialFeaturesSent = false;
-    private volatile boolean firstFramebufferReceived = false;
-    private int fpsCount = 0; // Frame counter for FPS display
-    private byte[] skipBuffer = new byte[65536]; // For skipping large data blocks
+    private int fpsCount = 0;
+    // FIX #1: track whether we've gotten the initial full frame
+    private volatile boolean fullFrameReceived = false;
 
     public interface Callback {
         void onConnected(int width, int height);
@@ -145,8 +108,6 @@ public class VeyonVncClient {
         this.privateKeyPem = privateKeyPem;
         this.surfaceHolder = holder;
         this.callback = cb;
-        Log.d(TAG, "VeyonVncClient created: host=" + host + ":" + port + ", keyName=" + keyName +
-              ", keyLen=" + (privateKeyPem != null ? privateKeyPem.length() : 0));
     }
 
     public void connect() {
@@ -176,52 +137,41 @@ public class VeyonVncClient {
                     return;
                 } catch (Exception attemptError) {
                     lastError = attemptError;
-                    boolean canRetry =
-                            i < SIGNATURE_ALGORITHMS.length - 1
-                                    && "security_result".equals(protocolStep)
-                                    && hasEofInChain(attemptError);
-                    Log.w(TAG, "Connection attempt failed (alg=" + activeSignatureAlgorithm
-                            + ", step=" + protocolStep + "): " + buildDetailedErrorMessage(attemptError));
+                    boolean canRetry = i < SIGNATURE_ALGORITHMS.length - 1
+                            && "security_result".equals(protocolStep)
+                            && hasEofInChain(attemptError);
+                    Log.w(TAG, "Attempt failed (alg=" + activeSignatureAlgorithm + "): " + attemptError.getMessage());
                     closeSocketQuietly();
-                    if (canRetry) {
-                        Log.w(TAG, "Retrying with next signature algorithm");
-                        continue;
-                    }
+                    if (canRetry) continue;
                     throw attemptError;
                 }
             }
             if (lastError != null) throw lastError;
-
         } catch (Exception e) {
             if (running.get()) {
-                boolean remoteCloseDuringReceiveLoop =
-                        "receive_loop".equals(protocolStep) &&
-                                (hasEofInChain(e) || hasSocketResetInChain(e));
-                if (remoteCloseDuringReceiveLoop) {
+                boolean remoteClose = "receive_loop".equals(protocolStep)
+                        && (hasEofInChain(e) || hasSocketResetInChain(e));
+                if (remoteClose) {
                     cleanRemoteClose = true;
-                    Log.i(TAG, "Server closed connection during receive loop", e);
                 } else {
-                    String detailed = buildDetailedErrorMessage(e);
-                    Log.e(TAG, "Connection error: " + detailed, e);
-                    callback.onError(detailed);
+                    Log.e(TAG, "Connection error: " + e.getMessage(), e);
+                    callback.onError(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
                 }
             }
         } finally {
             running.set(false);
             closeSocketQuietly();
-            callback.onDisconnected(cleanRemoteClose ? "Remote closed stream" : "Connection closed");
+            callback.onDisconnected(cleanRemoteClose ? "Remote closed" : "Connection closed");
         }
     }
 
     private void runConnectionAttempt() throws Exception {
-        Log.d(TAG, "=== VeyonVNC starting connection ===");
-        Log.d(TAG, "Connecting to " + host + ":" + port + " using " + activeSignatureAlgorithm);
+        Log.d(TAG, "Connecting to " + host + ":" + port + " alg=" + activeSignatureAlgorithm);
         socket = new Socket();
         socket.connect(new InetSocketAddress(host, port), 8000);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(10000); // 10 second timeout
-        byteCounter = new ByteCounter(socket.getInputStream());
-        pbIn = new PushbackInputStream(byteCounter, 16);
+        socket.setSoTimeout(10000);
+        pbIn = new PushbackInputStream(socket.getInputStream(), 16);
         in = new DataInputStream(pbIn);
         out = new DataOutputStream(socket.getOutputStream());
 
@@ -229,40 +179,28 @@ public class VeyonVncClient {
         rfbHandshake();
 
         protocolStep = "security_negotiate";
-        int secType = negotiateSecurity();
-        if (secType != SEC_TYPE_VEYON)
-            throw new IOException("No Veyon security type, got: " + secType);
+        if (negotiateSecurity() != SEC_TYPE_VEYON)
+            throw new IOException("No Veyon security type");
 
         protocolStep = "veyon_auth";
         veyonAuthenticate();
 
         protocolStep = "security_result";
-        // Check for optional ACK after signature before reading security result
         consumeOptionalPostAuthAck();
-        
-        // Read the security result (0=success, non-zero=failure with error message)
-        Log.d(TAG, "Reading security result, available bytes: " + pbIn.available());
         int secResult = in.readInt();
-        Log.d(TAG, "Security result: 0x" + Integer.toHexString(secResult) + " (0=success)");
         if (secResult != 0) {
             int errLen = in.readInt();
             byte[] errBytes = new byte[errLen];
             in.readFully(errBytes);
             throw new IOException("Auth failed: " + new String(errBytes));
         }
-        Log.d(TAG, "Authentication successful (" + activeSignatureAlgorithm + ")");
+        Log.d(TAG, "Auth OK (" + activeSignatureAlgorithm + ")");
 
         protocolStep = "client_init";
-        // Send ClientInit: 1 byte shared-desktop-flag (1 = shared mode)
         out.writeByte(1);
         out.flush();
-        Log.d(TAG, "ClientInit sent (shared=1), output buffer flushed");
-        
-        // Small delay to ensure ClientInit reaches server before we read
-        try { Thread.sleep(50); } catch (InterruptedException e) {}
 
         protocolStep = "server_init";
-        Log.d(TAG, "Reading ServerInit, available bytes: " + pbIn.available());
         fbWidth = in.readUnsignedShort();
         fbHeight = in.readUnsignedShort();
         byte[] pixelFormat = new byte[16];
@@ -270,278 +208,153 @@ public class VeyonVncClient {
         int nameLen = in.readInt();
         byte[] nameBytes = new byte[nameLen];
         in.readFully(nameBytes);
-        Log.d(TAG, "ServerInit: " + fbWidth + "x" + fbHeight + " name=" + new String(nameBytes));
+        Log.d(TAG, "ServerInit: " + fbWidth + "x" + fbHeight + " " + new String(nameBytes));
 
         framebuffer = Bitmap.createBitmap(fbWidth, fbHeight, Bitmap.Config.ARGB_8888);
+        pixelBuffer = new int[fbWidth * fbHeight]; // Allocate once to reduce GC
+        rowBuffer = new byte[fbWidth * 4]; // Max row size for pixel reading
+        fullFrameReceived = false;
         callback.onConnected(fbWidth, fbHeight);
 
+        // FIX #2: pixel format — little-endian, red shift=0 means server sends [B,G,R,X]
+        // We read byte0=B, byte1=G, byte2=R → fix in processRawRect: swap R and B
         sendSetPixelFormat();
         sendSetEncodings();
-        out.flush();
-
-        // Send ONLY monitoring mode feature message
-        // This tells the server we want to RECEIVE frames (monitoring mode)
         sendFeatureMessage(FEATURE_MONITORING_MODE, true, null);
         out.flush();
-        
-        // Wait for server to process and activate monitoring
-        try { Thread.sleep(500); } catch (InterruptedException e) {}
 
-        // NOW send FBU requests to start receiving frames
-        for (int i = 0; i < 3; i++) {
-            sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, false);
-            out.flush();
-            try { Thread.sleep(50); } catch (InterruptedException e) {}
-        }
-
-        Log.d(TAG, "VNC session established; waiting for frames");
+        // FIX #2: richiedi un SOLO full update iniziale, senza incrementale duplicato
+        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, false);
+        out.flush();
 
         protocolStep = "receive_loop";
-        Log.d(TAG, "Entering receive loop, available bytes: " + pbIn.available());
         receiveLoop();
     }
 
     // ─── RFB Handshake ─────────────────────────────────────────────────────────
 
     private void rfbHandshake() throws IOException {
-        byte[] serverVersion = new byte[12];
+        byte[] ver = new byte[12];
         int read = 0;
-        while (read < serverVersion.length) {
-            int n = in.read(serverVersion, read, serverVersion.length - read);
-            if (n < 0) {
-                String partial = read > 0
-                        ? new String(Arrays.copyOf(serverVersion, read)).replace("\n", "\\n")
-                        : "<empty>";
-                throw new IOException(
-                        "Server closed before RFB handshake (received " + read + "/12 bytes, data=" + partial + "). " +
-                                "Likely wrong port/service or Veyon Service not accepting VNC."
-                );
-            }
+        while (read < 12) {
+            int n = in.read(ver, read, 12 - read);
+            if (n < 0) throw new IOException("Server closed during handshake");
             read += n;
         }
-        String serverVersionStr = new String(serverVersion).trim();
-        Log.d(TAG, "Server version: " + serverVersionStr);
-        if (!serverVersionStr.startsWith("RFB")) {
-            throw new IOException("Invalid RFB banner: " + serverVersionStr);
-        }
+        String vs = new String(ver).trim();
+        Log.d(TAG, "Server version: " + vs);
+        if (!vs.startsWith("RFB")) throw new IOException("Invalid RFB: " + vs);
         out.write("RFB 003.008\n".getBytes());
         out.flush();
     }
 
-    // ─── Security Negotiation ──────────────────────────────────────────────────
-
     private int negotiateSecurity() throws IOException {
-        int numTypes = in.readUnsignedByte();
-        if (numTypes == 0) {
-            int errLen = in.readInt();
-            byte[] err = new byte[errLen];
-            in.readFully(err);
-            throw new IOException("Server error: " + new String(err));
+        int n = in.readUnsignedByte();
+        if (n == 0) {
+            int el = in.readInt();
+            byte[] eb = new byte[el];
+            in.readFully(eb);
+            throw new IOException("Server error: " + new String(eb));
         }
-        int veyonType = -1;
-        for (int i = 0; i < numTypes; i++) {
+        int veyon = -1;
+        for (int i = 0; i < n; i++) {
             int t = in.readUnsignedByte();
-            Log.d(TAG, "Security type offered: " + t);
-            if (t == SEC_TYPE_VEYON) veyonType = t;
+            Log.d(TAG, "Security type: " + t);
+            if (t == SEC_TYPE_VEYON) veyon = t;
         }
-        if (veyonType == -1) throw new IOException("No Veyon security type offered");
+        if (veyon == -1) throw new IOException("No Veyon security type");
         out.writeByte(SEC_TYPE_VEYON);
         out.flush();
-        return veyonType;
+        return veyon;
     }
 
     // ─── Veyon Authentication ──────────────────────────────────────────────────
 
     private void veyonAuthenticate() throws Exception {
-        // 1. Ricevi tipi auth (server manda con count)
         int[] authTypes = receiveVariantIntArray();
-        Log.d(TAG, "Available auth types: " + Arrays.toString(authTypes));
+        Log.d(TAG, "Auth types: " + Arrays.toString(authTypes));
+        int selected = -1;
+        for (int candidate : new int[]{3, 2, 4})
+            for (int t : authTypes)
+                if (t == candidate) { selected = candidate; break; }
+        if (selected == -1) throw new IOException("No KeyFile auth");
+        Log.d(TAG, "Selected auth: " + selected);
 
-        int selectedType = -1;
-        for (int candidate : new int[]{3, 2, 4}) {
-            for (int t : authTypes) {
-                if (t == candidate) { selectedType = candidate; break; }
-            }
-            if (selectedType != -1) break;
-        }
-        if (selectedType == -1)
-            throw new IOException("No KeyFile auth. Available: " + Arrays.toString(authTypes));
-        Log.d(TAG, "Selected auth type: " + selectedType);
-
-        // 2. Manda [authType, username] SENZA count
-        sendAuthTypeAndUsername(selectedType, "veyon-mobile");
-        Log.d(TAG, "Auth type + username sent");
-
-        // 3-4. Alcuni server inviano prima ACK vuoto (msgSize=0), altri inviano subito challenge.
+        sendAuthTypeAndUsername(selected, "veyon-mobile");
         byte[] challenge = receiveChallengeWithOptionalAck();
-        Log.d(TAG, "Challenge: " + challenge.length + " bytes");
         if (challenge.length == 0) throw new IOException("Empty challenge");
+        Log.d(TAG, "Challenge: " + challenge.length + " bytes");
 
-        // 5. Firma con RSA
         byte[] signature = signChallenge(challenge);
-        Log.d(TAG, "Signature: " + signature.length + " bytes");
-
-        // 6. Manda [keyName, signature] SENZA count
-        String sigHex = String.format("%02X%02X%02X%02X%02X%02X%02X%02X...",
-                signature[0] & 0xFF, signature[1] & 0xFF, signature[2] & 0xFF,
-                signature[3] & 0xFF, signature[4] & 0xFF, signature[5] & 0xFF,
-                signature[6] & 0xFF, signature[7] & 0xFF);
-        Log.d(TAG, "Sending signature for keyName: '" + keyName + "' (sigLen=" + signature.length + 
-              ", first8=" + sigHex + ")");
         sendVariantStringAndBytes(keyName, signature);
         Log.d(TAG, "Auth response sent");
     }
 
-    /** Consume optional ACK (empty VariantArrayMessage) after signature response */
     private void consumeOptionalPostAuthAck() throws IOException {
-        // Only check if data is immediately available - don't block
-        if (pbIn.available() < 4) {
-            Log.d(TAG, "No post-auth ACK available (available=" + pbIn.available() + ")");
-            return;
-        }
-        
-        byte[] peekBuf = new byte[4];
-        int bytesRead = pbIn.read(peekBuf);
-        if (bytesRead < 4) {
-            if (bytesRead > 0) pbIn.unread(peekBuf, 0, bytesRead);
-            return;
-        }
-
-        int msgSize = ((peekBuf[0] & 0xFF) << 24) | ((peekBuf[1] & 0xFF) << 16) |
-                      ((peekBuf[2] & 0xFF) << 8) | (peekBuf[3] & 0xFF);
-        
-        if (msgSize == 0) {
-            Log.d(TAG, "Post-auth ACK consumed (msgSize=0)");
-            // ACK consumed, don't push back
-        } else {
-            // Not an ACK, push back for security_result reading
-            pbIn.unread(peekBuf, 0, 4);
-            Log.d(TAG, "No post-auth ACK, msgSize=" + msgSize + " (will be security result)");
-        }
+        if (pbIn.available() < 4) return;
+        byte[] peek = new byte[4];
+        int n = pbIn.read(peek);
+        if (n < 4) { if (n > 0) pbIn.unread(peek, 0, n); return; }
+        int msgSize = ((peek[0] & 0xFF) << 24) | ((peek[1] & 0xFF) << 16)
+                | ((peek[2] & 0xFF) << 8)  |  (peek[3] & 0xFF);
+        if (msgSize != 0) pbIn.unread(peek, 0, 4);
+        else Log.d(TAG, "Post-auth ACK consumed");
     }
 
-    // ─── VariantArrayMessage I/O ───────────────────────────────────────────────
-
-    /** Server → Client: [msgSize] [QVariant<Int>:count] [QVariant<Int>:item ...] */
     private int[] receiveVariantIntArray() throws IOException {
         int msgSize = in.readInt();
-        Log.d(TAG, "receiveVariantIntArray: msgSize=" + msgSize);
-        if (msgSize <= 0 || msgSize > 65536) throw new IOException("Invalid msgSize: " + msgSize);
-
+        if (msgSize <= 0 || msgSize > 65536) throw new IOException("Bad msgSize: " + msgSize);
         byte[] buf = new byte[msgSize];
         in.readFully(buf);
-        java.io.DataInputStream dis = new java.io.DataInputStream(
-                new java.io.ByteArrayInputStream(buf));
-
-        // Leggi count come QVariant<Int>: [type=2][isNull][value]
-        dis.readInt();           // QMetaType::Int
-        dis.readUnsignedByte();  // isNull
-        int count = dis.readInt();
-        Log.d(TAG, "receiveVariantIntArray: count=" + count);
-
+        java.io.DataInputStream d = new java.io.DataInputStream(new java.io.ByteArrayInputStream(buf));
+        d.readInt(); d.readUnsignedByte(); // count QVariant header
+        int count = d.readInt();
         int[] result = new int[count];
         for (int i = 0; i < count; i++) {
-            int qtype = dis.readInt();
-            dis.readUnsignedByte(); // isNull
-            result[i] = dis.readInt();
-            Log.d(TAG, "  variant[" + i + "]: type=" + qtype + " value=" + result[i]);
+            d.readInt(); d.readUnsignedByte();
+            result[i] = d.readInt();
         }
         return result;
     }
 
-    /** Server → Client: challenge con ACK opzionale prima del payload. */
     private byte[] receiveChallengeWithOptionalAck() throws IOException {
-        int firstMsgSize = in.readInt();
-        Log.d(TAG, "receiveChallengeWithOptionalAck: firstMsgSize=" + firstMsgSize);
-
-        if (firstMsgSize < 0 || firstMsgSize > 65536) {
-            throw new IOException("Invalid first message size: " + firstMsgSize);
-        }
-
-        int challengeMsgSize = firstMsgSize;
-        if (firstMsgSize == 0) {
-            Log.d(TAG, "ACK received (empty VariantArrayMessage)");
-            challengeMsgSize = in.readInt();
-            Log.d(TAG, "receiveChallengeWithOptionalAck: challengeMsgSize=" + challengeMsgSize);
-        }
-
-        if (challengeMsgSize <= 0 || challengeMsgSize > 65536) {
-            throw new IOException("Invalid challenge msgSize: " + challengeMsgSize);
-        }
-
-        byte[] payload = new byte[challengeMsgSize];
+        int first = in.readInt();
+        if (first < 0 || first > 65536) throw new IOException("Bad msg size: " + first);
+        int challengeSize = (first == 0) ? in.readInt() : first;
+        if (challengeSize <= 0 || challengeSize > 65536) throw new IOException("Bad challenge size: " + challengeSize);
+        byte[] payload = new byte[challengeSize];
         in.readFully(payload);
-        return parseVariantByteArrayPayload(payload, challengeMsgSize);
-    }
-
-    private byte[] parseVariantByteArrayPayload(byte[] payload, int msgSize) throws IOException {
-        java.io.DataInputStream dis = new java.io.DataInputStream(
-                new java.io.ByteArrayInputStream(payload));
-
-        // QVariant<ByteArray>: [type=12][isNull][len][data]
-        int type = dis.readInt();
-        int isNull = dis.readUnsignedByte();
-        Log.d(TAG, "parseVariantByteArrayPayload: type=" + type + " isNull=" + isNull);
-        if (type != QMT_BYTEARRAY) {
-            throw new IOException("Expected QVariant<QByteArray>, got type=" + type);
-        }
+        java.io.DataInputStream d = new java.io.DataInputStream(new java.io.ByteArrayInputStream(payload));
+        int type = d.readInt();
+        int isNull = d.readUnsignedByte();
+        if (type != QMT_BYTEARRAY) throw new IOException("Expected ByteArray, got type=" + type);
         if (isNull != 0) return new byte[0];
-
-        int len = dis.readInt();
-        Log.d(TAG, "parseVariantByteArrayPayload: len=" + len);
-        if (len < 0 || len > msgSize - 9) {
-            throw new IOException("Invalid QByteArray length: " + len + " (msgSize=" + msgSize + ")");
-        }
+        int len = d.readInt();
         byte[] data = new byte[len];
-        dis.readFully(data);
+        d.readFully(data);
         return data;
     }
 
     private void sendAuthTypeAndUsername(int authType, String username) throws IOException {
-        byte[] usernameUtf16 = username.getBytes("UTF-16BE");
-
-        // Client -> Server (Veyon): [msgSize][QVariant<Int>][QVariant<QString>] (senza count)
-        int payloadSize = 9 + (4 + 1 + 4 + usernameUtf16.length);
-
-        out.writeInt(payloadSize);
-
-        // QVariant<Int>
-        out.writeInt(QMT_INT);
-        out.writeByte(0);
-        out.writeInt(authType);
-
-        // QVariant<QString> (Qt writes UTF-16BE bytes preceded by a byte length)
-        out.writeInt(10); // QMetaType::QString
-        out.writeByte(0);
-        out.writeInt(usernameUtf16.length);
-        if (usernameUtf16.length > 0) out.write(usernameUtf16);
+        byte[] u = username.getBytes("UTF-16BE");
+        int size = 9 + (4 + 1 + 4 + u.length);
+        out.writeInt(size);
+        out.writeInt(QMT_INT); out.writeByte(0); out.writeInt(authType);
+        out.writeInt(10); out.writeByte(0); out.writeInt(u.length);
+        if (u.length > 0) out.write(u);
         out.flush();
     }
 
     private void sendVariantStringAndBytes(String str, byte[] bytes) throws IOException {
-        byte[] strUtf16 = str.getBytes("UTF-16BE");
-        // Client -> Server (Veyon): [msgSize][QVariant<QString>][QVariant<QByteArray>] (senza count)
-        // QVariant<QString>: [type=10 (4 bytes)][isNull=0 (1 byte)][length (4 bytes)][data (length bytes)]
-        // QVariant<QByteArray>: [type=12 (4 bytes)][isNull=0 (1 byte)][length (4 bytes)][data (length bytes)]
-        int payloadSize = (4 + 1 + 4 + strUtf16.length) + (4 + 1 + 4 + bytes.length);
-
-        out.writeInt(payloadSize);
-
-        // QVariant<QString>
-        out.writeInt(10); // QMetaType::QString
-        out.writeByte(0); // isNull
-        out.writeInt(strUtf16.length);
-        if (strUtf16.length > 0) out.write(strUtf16);
-
-        // QVariant<QByteArray>
-        out.writeInt(QMT_BYTEARRAY);
-        out.writeByte(0); // isNull
-        out.writeInt(bytes.length);
+        byte[] s = str.getBytes("UTF-16BE");
+        int size = (4 + 1 + 4 + s.length) + (4 + 1 + 4 + bytes.length);
+        out.writeInt(size);
+        out.writeInt(10); out.writeByte(0); out.writeInt(s.length);
+        if (s.length > 0) out.write(s);
+        out.writeInt(QMT_BYTEARRAY); out.writeByte(0); out.writeInt(bytes.length);
         out.write(bytes);
         out.flush();
     }
-
-    // ─── RSA Signing ──────────────────────────────────────────────────────────
 
     private byte[] signChallenge(byte[] challenge) throws Exception {
         String pem = privateKeyPem
@@ -549,10 +362,9 @@ public class VeyonVncClient {
                 .replace("-----END PRIVATE KEY-----", "")
                 .replaceAll("\\s+", "");
         byte[] keyBytes = Base64.decode(pem, Base64.DEFAULT);
-        KeyFactory factory = KeyFactory.getInstance("RSA");
-        PrivateKey privateKey = factory.generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
+        PrivateKey pk = KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
         Signature sig = Signature.getInstance(activeSignatureAlgorithm);
-        sig.initSign(privateKey);
+        sig.initSign(pk);
         sig.update(challenge);
         return sig.sign();
     }
@@ -560,45 +372,37 @@ public class VeyonVncClient {
     // ─── RFB Pixel Format & Encodings ─────────────────────────────────────────
 
     private void sendSetPixelFormat() throws IOException {
+        // FIX #1 (colori): little-endian, red-shift=0, green-shift=8, blue-shift=16
+        // Il server manda bytes nell'ordine [R, G, B, X] con questi shift in little-endian
         out.writeByte(MSG_SET_PIXEL_FORMAT);
-        out.writeByte(0); out.writeByte(0); out.writeByte(0);
-        out.writeByte(32); out.writeByte(24);
-        out.writeByte(0);  // little endian
+        out.writeByte(0); out.writeByte(0); out.writeByte(0); // padding
+        out.writeByte(32); // bpp
+        out.writeByte(24); // depth
+        out.writeByte(0);  // little-endian
         out.writeByte(1);  // true colour
-        out.writeShort(255); out.writeShort(255); out.writeShort(255);
-        // BGR format (Veyon sends BGR, not RGB)
-        out.writeByte(0); out.writeByte(8); out.writeByte(16);  // BGR: blue shift 0, green shift 8, red shift 16
-        out.writeByte(0); out.writeByte(0); out.writeByte(0);
+        out.writeShort(255); out.writeShort(255); out.writeShort(255); // max R/G/B
+        out.writeByte(0);  // red-shift   → R in byte 0
+        out.writeByte(8);  // green-shift → G in byte 1
+        out.writeByte(16); // blue-shift  → B in byte 2
+        out.writeByte(0); out.writeByte(0); out.writeByte(0); // padding
         out.flush();
     }
 
     private void sendSetEncodings() throws IOException {
-        // Send encodings in priority order - HEXTILE first (most reliable)
-        // ZLIBHEX/ZLIB disabled due to decompression bugs
         int[] encodings = {
-            0x00000005,  // HEXTILE (preferred - efficient and reliable)
-            0x00000000,  // RAW (fallback - always works)
-            0x00000001,  // CopyRect
-            0x00000002,  // RRE
-            0x00000004,  // CoRRE
-            0xFFFFFFFA,  // DesktopSize
-            0xFFFF0010,  // Cursor pseudo-encoding
-            0xFFFFFF21,  // QEMUExtendedKeyEvent
-            0xFFFFFF17,  // CursorPos
-            0xFFFFFF18,  // PointerPos
-            0xFFFFFF19,  // KeyboardLedState
-            0xFFFFFF20,  // QEMUPointerMotionChange
-            0xFFFFFF22,  // QEMUAudio
-            0xFFFFFF23,  // QEMULEDState
-            0xFFFFFECC,  // VMWareCursor
-            // ZLIBHEX (6) and ZLIB (9) disabled - decompression bugs
+                ENC_HEXTILE,   // 5  - efficiente, supportato
+                ENC_ZLIB,      // 9  - compresso
+                ENC_RRE,       // 2
+                ENC_CORRE,     // 4
+                ENC_COPY_RECT, // 1
+                ENC_RAW,       // 0  - fallback
+                0xFFFFFF21,    // DesktopSize
         };
         out.writeByte(MSG_SET_ENCODINGS);
         out.writeByte(0);
         out.writeShort(encodings.length);
         for (int enc : encodings) out.writeInt(enc);
         out.flush();
-        Log.d(TAG, "Sent encodings: " + encodings.length + " entries (HEXTILE preferred, ZLIB disabled)");
     }
 
     private void sendFramebufferUpdateRequest(int x, int y, int w, int h, boolean incremental)
@@ -614,133 +418,75 @@ public class VeyonVncClient {
 
     private void receiveLoop() throws IOException {
         long fpsTime = System.currentTimeMillis();
+        long lastMonitoringPing = System.currentTimeMillis();
         long lastFramebufferRequestMs = System.currentTimeMillis();
-        long lastMonitoringPingMs = System.currentTimeMillis();
-
-        // Timeout più ragionevole: 1 secondo invece di 200ms
-        socket.setSoTimeout(1000); // Increased timeout to prevent premature disconnections
-
-        // Send an initial incremental FBU request to keep the connection alive
-        try {
-            sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-        } catch (IOException e) {
-            Log.w(TAG, "Failed to send initial FBU request: " + e.getMessage());
-        }
+        // FIX #4 (FPS): timeout più lungo, no Log.d nel loop caldo
+        socket.setSoTimeout(5000);
 
         while (running.get()) {
             try {
-                Log.d(TAG, "Waiting for next message, available=" + pbIn.available());
-
-                // Peek ahead to log what's coming
-                if (pbIn.available() > 0) {
-                    byte[] peek = new byte[Math.min(16, pbIn.available())];
-                    int n = pbIn.read(peek);
-                    StringBuilder sb = new StringBuilder("Next bytes: ");
-                    for (int pi = 0; pi < n; pi++) sb.append(String.format("%02x ", peek[pi] & 0xFF));
-                    Log.d(TAG, sb.toString());
-                    pbIn.unread(peek, 0, n);
-                }
-
                 int msgType = in.readUnsignedByte();
-                Log.d(TAG, "Server msg type: 0x" + Integer.toHexString(msgType) + 
-                      ", available=" + pbIn.available());
 
                 switch (msgType) {
-                    case MSG_SERVER_FRAMEBUFFER_UPDATE:
+                    case MSG_SERVER_FRAMEBUFFER_UPDATE: {
                         in.readUnsignedByte(); // padding
                         int numRects = in.readUnsignedShort();
-                        Log.d(TAG, "Framebuffer update: numRects=" + numRects);
-
-                        // VALIDAZIONE - allow up to 500 rects for HEXTILE encoding
-                        if (numRects < 0 || numRects > 500) {
-                            Log.e(TAG, "Invalid numRects: " + numRects + ", possible desync");
-                            throw new IOException("Invalid number of rectangles: " + numRects);
-                        }
-                        Log.d(TAG, "Processing " + numRects + " rectangles...");
-                        for (int i = 0; i < numRects; i++) {
-                            processRect();
-                        }
-                        Log.d(TAG, "All rects processed");
-
-                        // Send FBU request IMMEDIATELY after processing rects, BEFORE rendering
-                        // This keeps the pipeline full while we're slow Java rendering
-                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                        out.flush();
-
-                        // Renderizza (slow operation)
-                        renderFrame();
+                        if (numRects > 1000) throw new IOException("Invalid numRects: " + numRects);
+                        for (int i = 0; i < numRects; i++) processRect();
                         fpsCount++;
-
-                        if (!firstFramebufferReceived) {
-                            firstFramebufferReceived = true;
-                            Log.d(TAG, "First framebuffer received");
+                        // Render after processing all rects
+                        if (!fullFrameReceived) {
+                            fullFrameReceived = true;
+                            renderFrame();
+                            Log.d(TAG, "Full frame received, switching to incremental");
+                        } else {
+                            renderFrame();
                         }
-
-                        lastFramebufferRequestMs = System.currentTimeMillis();
+                        // Send FBU request after rendering (throttled to ~30 FPS)
+                        long now = System.currentTimeMillis();
+                        if (now - lastFramebufferRequestMs >= 33) { // 33ms = ~30 FPS
+                            sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                            lastFramebufferRequestMs = now;
+                        }
                         break;
-
+                    }
                     case MSG_SERVER_BELL:
-                        Log.d(TAG, "Bell received");
                         break;
-
-                    case MSG_SERVER_CUT_TEXT:
-                        // Skip 3 bytes (padding)
+                    case MSG_SERVER_CUT_TEXT: {
                         in.readUnsignedByte(); in.readUnsignedByte(); in.readUnsignedByte();
-                        int textLen = in.readInt();
-                        byte[] text = new byte[textLen];
-                        in.readFully(text);
-                        Log.d(TAG, "Server cut text: " + textLen + " bytes");
+                        int tl = in.readInt();
+                        byte[] tb = new byte[tl];
+                        in.readFully(tb);
                         break;
-
-                    case 0x29: // Veyon FeatureMessage
+                    }
+                    case MSG_VEYON_FEATURE: {
                         int fmSize = in.readInt();
                         if (fmSize > 0 && fmSize < 65536) {
                             byte[] fmData = new byte[fmSize];
                             in.readFully(fmData);
-                            // Parse and respond to feature messages
                             handleFeatureMessage(fmData);
                         }
-                        // Don't send FBU requests here - let the normal flow handle it
                         break;
-
+                    }
                     default:
-                        Log.w(TAG, "Unknown server message type: 0x" + Integer.toHexString(msgType));
-                        // Se il server invia un tipo sconosciuto, potrebbe essere un errore
-                        // o una desincronizzazione. Logghiamo e continuiamo.
+                        Log.w(TAG, "Unknown msg: 0x" + Integer.toHexString(msgType));
                         break;
                 }
 
             } catch (SocketTimeoutException timeout) {
-                // Send a keepalive FBU request to prevent server idle timeout
-                try {
-                    sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                } catch (IOException ignored) {}
+                // Keepalive - request new frame on timeout
+                sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
+                lastFramebufferRequestMs = System.currentTimeMillis();
             }
+
             if (Thread.interrupted()) break;
 
+            // Monitoring keepalive every 30 seconds
             long now = System.currentTimeMillis();
-
-            // KEEPALIVE: re-request frame every 200ms if server goes quiet
-            if (now - lastFramebufferRequestMs >= 200) {
-                sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                out.flush();
-                lastFramebufferRequestMs = now;
+            if (now - lastMonitoringPing >= KEEPALIVE_MONITORING_PING_MS) {
+                try { sendFeatureMessage(FEATURE_MONITORING_MODE, true, null); } catch (IOException ignored) {}
+                lastMonitoringPing = now;
             }
-
-            // Keepalive monitoring (molto meno frequente)
-            if (now - lastMonitoringPingMs >= KEEPALIVE_MONITORING_PING_MS) {
-                try {
-                    // Invia solo monitoring mode, non tutti i feature
-                    sendFeatureMessage(FEATURE_MONITORING_MODE, true, null);
-                } catch (IOException e) {
-                    Log.w(TAG, "Monitoring ping failed: " + e.getMessage());
-                }
-                lastMonitoringPingMs = now;
-            }
-
-            // FPS counter
             if (now - fpsTime >= 1000) {
                 callback.onFpsUpdate(fpsCount);
                 fpsCount = 0;
@@ -752,154 +498,52 @@ public class VeyonVncClient {
     // ─── Rectangle Processing ─────────────────────────────────────────────────
 
     private void processRect() throws IOException {
-        int x = in.readUnsignedShort();
-        int y = in.readUnsignedShort();
-        int w = in.readUnsignedShort();
-        int h = in.readUnsignedShort();
-        int encoding = in.readInt();
+        int x = in.readUnsignedShort(), y = in.readUnsignedShort();
+        int w = in.readUnsignedShort(), h = in.readUnsignedShort();
+        int enc = in.readInt();
 
-        Log.d(TAG, "processRect: x=" + x + " y=" + y + " w=" + w + " h=" + h + " encoding=" + encoding + 
-              " (0x" + Integer.toHexString(encoding) + ")");
-
-        // Pseudo-encodings can have unusual dimensions - check after identifying encoding
-        boolean isPseudoEncoding = encoding < 0;
-        
-        // Pseudo-encodings (negative values or special values)
-        if (encoding == ENC_NEW_FB_SIZE) {
-            Log.d(TAG, "New framebuffer size: " + w + "x" + h);
-            return;
-        }
-        if (encoding == ENC_LAST_RECT) {
-            Log.d(TAG, "Last rect marker");
-            return;
-        }
-        
-        // PointerPos pseudo-encoding (0xFFFFFF18 = -232)
-        if (encoding == -232 || encoding == 0xFFFFFF18) {
-            // PointerPos: cursor position is in x,y from rect header
-            // NO additional data payload!
-            Log.d(TAG, "PointerPos skipped: cursor at (" + x + "," + y + ")");
+        // Pseudo-encodings senza payload
+        if (enc == -223 || enc == -224) return; // DesktopSize / LastRect
+        if (enc == -232) return; // PointerPos
+        if (enc < 0) {
+            // Pseudo-encoding sconosciuto — non ha payload dati standard
+            Log.w(TAG, "Unknown pseudo-enc: " + enc);
             return;
         }
 
-        // Validate dimensions for non-pseudo encodings
-        if (!isPseudoEncoding && (x > fbWidth || y > fbHeight || w > fbWidth || h > fbHeight)) {
-            Log.e(TAG, "Rect dimensions exceed framebuffer: x=" + x + " y=" + y + " w=" + w + " h=" + h +
-                  " (fb=" + fbWidth + "x" + fbHeight + ") enc=" + encoding);
-            throw new IOException("Protocol desync - rect dimensions invalid");
-        }
-        // Cursor pseudo-encoding - skip the cursor data
-        if (encoding == -239 || encoding == 0xFFFF1710 || encoding == -306) {
-            // Cursor: w*h*4 bytes for colors + 2 bytes for hotspot x,y
-            int cursorSize = w * h * 4 + 4;
-            byte[] cursorData = new byte[cursorSize];
-            in.readFully(cursorData);
-            Log.d(TAG, "Cursor update skipped: " + w + "x" + h);
-            return;
-        }
-        // VMWareCursor pseudo-encoding (0xFFFFFECC = -308)
-        if (encoding == -308 || encoding == 0xFFFFFECC) {
-            // Veyon's VMWareCursor has a 4-byte payload (usage unknown, possibly flags)
-            int flags = in.readInt();
-            Log.d(TAG, "VMWareCursor: Veyon marker with flags=0x" + Integer.toHexString(flags));
-            return;
-        }
-        // DesktopSize pseudo-encoding
-        if (encoding == -223 || encoding == 0xFFFF21) {
-            Log.d(TAG, "DesktopSize update: " + w + "x" + h);
-            return;
-        }
-        // QEMU extended key events
-        if (encoding == -259 || encoding == 0xFFFF23) {
-            Log.d(TAG, "QEMU extended keys skipped");
-            return;
-        }
-        // QEMU pointer motion change
-        if (encoding == -260 || encoding == 0xFFFF24) {
-            Log.d(TAG, "QEMU pointer motion skipped");
-            return;
-        }
-        // QEMU audio
-        if (encoding == -261 || encoding == 0xFFFF25) {
-            Log.d(TAG, "QEMU audio skipped");
-            return;
-        }
-        // QEMU LED state
-        if (encoding == -263 || encoding == 0xFFFF27) {
-            Log.d(TAG, "QEMU LED state skipped");
-            return;
-        }
-        // Unknown pseudo-encoding - try to skip
-        if (encoding < 0) {
-            Log.w(TAG, "Unknown pseudo-encoding: " + encoding + " skipping " + w + "x" + h);
-            // For pseudo-encodings, there's typically no rect data to skip
-            // But some might have data - be safe and skip w*h*4 bytes if it looks like pixel data
-            if (w > 0 && h > 0 && w < 1000 && h < 1000) {
-                int skipSize = w * h * 4;
-                if (skipSize > 0 && skipSize < 10000000) {
-                    Log.d(TAG, "Skipping " + skipSize + " bytes for unknown pseudo-encoding");
-                    long skipped = in.skip(skipSize);
-                    if (skipped < skipSize) {
-                        Log.w(TAG, "Only skipped " + skipped + "/" + skipSize + " bytes");
-                    }
-                }
-            }
-            return;
-        }
+        if (w == 0 || h == 0) return;
 
-        // ✅ VALIDAZIONE: Se i valori sono assurdi, siamo desincronizzati
-        if (x > 10000 || y > 10000 || w > 5000 || h > 5000 || w < 0 || h < 0) {
-            Log.e(TAG, "Invalid rect values, protocol desync: x=" + x + " y=" + y + " w=" + w + " h=" + h + " enc=" + encoding);
-            throw new IOException("Protocol desynchronization detected");
-        }
-
-        switch (encoding) {
+        switch (enc) {
             case ENC_RAW:       processRawRect(x, y, w, h);     break;
             case ENC_COPY_RECT: processCopyRect(x, y, w, h);    break;
             case ENC_RRE:       processRreRect(x, y, w, h);     break;
             case ENC_CORRE:     processCorreRect(x, y, w, h);   break;
             case ENC_HEXTILE:   processHexTileRect(x, y, w, h); break;
             case ENC_ZLIB:      processZlibRect(x, y, w, h);    break;
-            case ENC_ZLIBHEX:   processZlibHexRect(x, y, w, h); break;
             default:
-                Log.w(TAG, "Unsupported encoding: " + encoding + " — skipping rect " + w + "x" + h);
-                // For now, throw to reconnect - we can't safely skip unknown encodings
-                throw new IOException("Unsupported encoding: " + encoding);
+                Log.w(TAG, "Unsupported enc: " + enc);
+                throw new IOException("Unsupported encoding: " + enc);
         }
     }
 
+    // FIX #1 (colori): con red-shift=0, i bytes arrivano [R, G, B, X]
+    // quindi leggiamo byte0=R, byte1=G, byte2=B correttamente
     private void processRawRect(int x, int y, int w, int h) throws IOException {
-        int pixelCount = w * h;
-        int[] pixels = new int[pixelCount];
-        
-        // Read all pixel data at once for better performance
-        byte[] pixelData = new byte[pixelCount * 4]; // 4 bytes per pixel (BGRA)
-        in.readFully(pixelData);
-        
-        // Convert from server's BGR format to Android's ARGB format
-        // Server sends: B, G, R, padding (per pixel)
-        // We want: 0xAARRGGBB
-        for (int i = 0; i < pixelCount; i++) {
-            int offset = i * 4;
-            int b = pixelData[offset] & 0xFF;
-            int g = pixelData[offset + 1] & 0xFF;
-            int r = pixelData[offset + 2] & 0xFF;
-            // padding is at offset + 3, ignored
-            pixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
-        }
-        
-        if (framebuffer != null) {
-            synchronized (framebuffer) {
-                framebuffer.setPixels(pixels, 0, w, x, y, w, h);
+        // Optimized: read row by row to reduce memory allocation
+        synchronized (framebuffer) {
+            for (int row = 0; row < h; row++) {
+                in.readFully(rowBuffer, 0, w * 4);
+                for (int col = 0; col < w; col++) {
+                    int o = col * 4;
+                    pixelBuffer[col] = 0xFF000000
+                            | ((rowBuffer[o]   & 0xFF) << 16)  // R
+                            | ((rowBuffer[o+1] & 0xFF) << 8)   // G
+                            |  (rowBuffer[o+2] & 0xFF);         // B
+                }
+                framebuffer.setPixels(pixelBuffer, 0, w, x, y + row, w, 1);
             }
-            // Debug: log first pixel of first rect
-            if (x == 0 && y == 0) {
-                Log.d(TAG, "RawRect setPixels: " + w + "x" + h + " at (" + x + "," + y + 
-                      "), firstPixel=0x" + Integer.toHexString(pixels[0] & 0xFFFFFFFF));
-            }
-        } else {
-            Log.w(TAG, "RawRect: framebuffer is null!");
         }
+        framebufferDirty = true;
     }
 
     private void processCopyRect(int x, int y, int w, int h) throws IOException {
@@ -910,68 +554,104 @@ public class VeyonVncClient {
             framebuffer.getPixels(pixels, 0, w, srcX, srcY, w, h);
             framebuffer.setPixels(pixels, 0, w, x, y, w, h);
         }
+        framebufferDirty = true;
+    }
+
+    // Legge 4 bytes pixel (R,G,B,X) con red-shift=0
+    private int readPixel() throws IOException {
+        int r = in.readUnsignedByte();
+        int g = in.readUnsignedByte();
+        int b = in.readUnsignedByte();
+        in.readUnsignedByte(); // padding
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 
     private void processRreRect(int x, int y, int w, int h) throws IOException {
-        int numSubrects = in.readInt();
-        in.readUnsignedByte(); // padding
-        // BGR format
-        int bgB = in.readUnsignedByte(), bgG = in.readUnsignedByte(), bgR = in.readUnsignedByte();
-        in.readUnsignedByte(); // padding
-        int bg = 0xFF000000 | (bgR << 16) | (bgG << 8) | bgB;
+        int n = in.readInt();
+        int bg = readPixel();
         int[] pixels = new int[w * h];
         java.util.Arrays.fill(pixels, bg);
-        for (int i = 0; i < numSubrects; i++) {
-            in.readUnsignedByte(); // padding
-            int fgB = in.readUnsignedByte(), fgG = in.readUnsignedByte(), fgR = in.readUnsignedByte();
-            in.readUnsignedByte(); // padding
-            int fg = 0xFF000000 | (fgR << 16) | (fgG << 8) | fgB;
+        for (int i = 0; i < n; i++) {
+            int fg = readPixel();
             int sx = in.readUnsignedShort(), sy = in.readUnsignedShort();
             int sw = in.readUnsignedShort(), sh = in.readUnsignedShort();
-            for (int row = sy; row < sy + sh; row++)
-                for (int col = sx; col < sx + sw; col++)
-                    if (row < h && col < w) pixels[row * w + col] = fg;
+            for (int row = sy; row < sy + sh && row < h; row++)
+                for (int col = sx; col < sx + sw && col < w; col++)
+                    pixels[row * w + col] = fg;
         }
-        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+        if (framebuffer != null) {
+            synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+            framebufferDirty = true;
+        }
     }
 
     private void processCorreRect(int x, int y, int w, int h) throws IOException {
-        int numSubrects = in.readInt();
-        in.readUnsignedByte(); // padding
-        // BGR format
-        int bgB = in.readUnsignedByte(), bgG = in.readUnsignedByte(), bgR = in.readUnsignedByte();
-        in.readUnsignedByte(); // padding
-        int bg = 0xFF000000 | (bgR << 16) | (bgG << 8) | bgB;
+        int n = in.readInt();
+        int bg = readPixel();
         int[] pixels = new int[w * h];
         java.util.Arrays.fill(pixels, bg);
-        for (int i = 0; i < numSubrects; i++) {
-            in.readUnsignedByte(); // padding
-            int fgB = in.readUnsignedByte(), fgG = in.readUnsignedByte(), fgR = in.readUnsignedByte();
-            in.readUnsignedByte(); // padding
-            int fg = 0xFF000000 | (fgR << 16) | (fgG << 8) | fgB;
+        for (int i = 0; i < n; i++) {
+            int fg = readPixel();
             int sx = in.readUnsignedByte(), sy = in.readUnsignedByte();
             int sw = in.readUnsignedByte(), sh = in.readUnsignedByte();
-            for (int row = sy; row < sy + sh; row++)
-                for (int col = sx; col < sx + sw; col++)
-                    if (row < h && col < w) pixels[row * w + col] = fg;
+            for (int row = sy; row < sy + sh && row < h; row++)
+                for (int col = sx; col < sx + sw && col < w; col++)
+                    pixels[row * w + col] = fg;
         }
-        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+        if (framebuffer != null) {
+            synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+            framebufferDirty = true;
+        }
     }
 
     private void processHexTileRect(int x, int y, int w, int h) throws IOException {
         int TILE = 16;
-        int tilesX = (w + TILE - 1) / TILE;
-        int tilesY = (h + TILE - 1) / TILE;
-        int totalTiles = tilesX * tilesY;
-        for (int ty = 0; ty < tilesY; ty++) {
-            for (int tx = 0; tx < tilesX; tx++) {
-                int tileX = x + tx * TILE;
-                int tileY = y + ty * TILE;
-                int tileW = Math.min(TILE, w - tx * TILE);
-                int tileH = Math.min(TILE, h - ty * TILE);
-                int subenc = in.readUnsignedByte();
-                processHexTileFromStream(in, tileX, tileY, tileW, tileH, subenc);
+        for (int ty = 0; ty < h; ty += TILE) {
+            for (int tx = 0; tx < w; tx += TILE) {
+                int tw = Math.min(TILE, w - tx);
+                int th = Math.min(TILE, h - ty);
+                processHexTile(x + tx, y + ty, tw, th);
             }
+        }
+    }
+
+    private int hxBg = 0xFF000000, hxFg = 0xFFFFFFFF;
+
+    private void processHexTile(int x, int y, int w, int h) throws IOException {
+        int sub = in.readUnsignedByte();
+        int[] pixels = new int[w * h];
+        if ((sub & 1) != 0) {
+            // Raw
+            byte[] data = new byte[w * h * 4];
+            in.readFully(data);
+            for (int i = 0; i < w * h; i++) {
+                int o = i * 4;
+                pixels[i] = 0xFF000000
+                        | ((data[o]   & 0xFF) << 16)
+                        | ((data[o+1] & 0xFF) << 8)
+                        |  (data[o+2] & 0xFF);
+            }
+        } else {
+            if ((sub & 2) != 0) hxBg = readPixel();
+            if ((sub & 4) != 0) hxFg = readPixel();
+            java.util.Arrays.fill(pixels, hxBg);
+            if ((sub & 8) != 0) {
+                int ns = in.readUnsignedByte();
+                boolean colored = (sub & 16) != 0;
+                for (int i = 0; i < ns; i++) {
+                    int color = colored ? readPixel() : hxFg;
+                    int xy = in.readUnsignedByte(), wh = in.readUnsignedByte();
+                    int sx = (xy >> 4) & 0xF, sy = xy & 0xF;
+                    int sw = ((wh >> 4) & 0xF) + 1, sh = (wh & 0xF) + 1;
+                    for (int row = sy; row < sy + sh && row < h; row++)
+                        for (int col = sx; col < sx + sw && col < w; col++)
+                            pixels[row * w + col] = color;
+                }
+            }
+        }
+        if (framebuffer != null) {
+            synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+            framebufferDirty = true;
         }
     }
 
@@ -990,628 +670,202 @@ public class VeyonVncClient {
                 if (r <= 0) break;
                 total += r;
             }
-        } catch (Exception e) { throw new IOException("ZLIB inflate failed: " + e.getMessage()); }
-        int[] pixels = new int[w * h];
-        for (int i = 0; i < pixels.length; i++)
-            // Server sends BGRA pixels (4 bytes per pixel)
-            pixels[i] = 0xFF000000 | ((raw[i*4+2] & 0xFF) << 16) | ((raw[i*4+1] & 0xFF) << 8) | (raw[i*4] & 0xFF);
-        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
-    }
-
-    private void processZlibHexRect(int x, int y, int w, int h) throws IOException {
-        // ZlibHex: each 16x16 tile has a 1-byte subencoding; if bit 0x10 set, tile is zlib-compressed
-        int TILE = 16;
-        for (int ty = y; ty < y + h; ty += TILE) {
-            for (int tx = x; tx < x + w; tx += TILE) {
-                int tileW = Math.min(TILE, x + w - tx);
-                int tileH = Math.min(TILE, y + h - ty);
-                processZlibHexTile(tx, ty, tileW, tileH);
-            }
-        }
-    }
-
-    private void processZlibHexTile(int x, int y, int w, int h) throws IOException {
-        int subenc = in.readUnsignedByte();
-        boolean zlibEncoded = (subenc & 0x10) != 0;
-        int hextileSubenc = subenc & 0x0F;
-        if (zlibEncoded) {
-            // Read zlib-compressed hextile data
-            int dataLen = in.readUnsignedShort();
-            byte[] compressed = new byte[dataLen];
-            in.readFully(compressed);
-            // Decompress and process as raw hextile — simplified: treat as raw
-            Inflater inf = new Inflater();
-            inf.setInput(compressed);
-            byte[] raw = new byte[w * h * 4 + 16];
-            int total = 0;
-            try { while (total < raw.length) { int r = inf.inflate(raw, total, raw.length - total); if (r <= 0) break; total += r; } }
-            catch (Exception e) { throw new IOException("ZlibHex inflate failed"); }
-            // Parse as hextile from the decompressed buffer
-            java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.ByteArrayInputStream(raw, 0, total));
-            processHexTileFromStream(dis, x, y, w, h, hextileSubenc);
-        } else {
-            processHexTileFromStream(in, x, y, w, h, hextileSubenc);
-        }
-    }
-
-    private int hextileBg = 0xFF000000, hextileFg = 0xFFFFFFFF;
-
-    private void processHexTileFromStream(DataInputStream src, int x, int y, int w, int h, int subenc) throws IOException {
-        boolean raw = (subenc & 1) != 0;
-        boolean bgSpec = (subenc & 2) != 0;
-        boolean fgSpec = (subenc & 4) != 0;
-        boolean anySubrects = (subenc & 8) != 0;
-        boolean subrectsColored = (subenc & 16) != 0;
-
-        int[] pixels = new int[w * h];
-        if (raw) {
-            // Raw hextile: 4 bytes per pixel (B, G, R, padding) - BGR format
-            for (int i = 0; i < pixels.length; i++) {
-                int b = src.readUnsignedByte();
-                int g = src.readUnsignedByte();
-                int r = src.readUnsignedByte();
-                src.readUnsignedByte(); // padding
-                pixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
-            }
-        } else {
-            // Background color if specified (4 bytes: B, G, R, padding)
-            if (bgSpec) {
-                int b = src.readUnsignedByte();
-                int g = src.readUnsignedByte();
-                int r = src.readUnsignedByte();
-                src.readUnsignedByte(); // padding
-                hextileBg = 0xFF000000 | (r << 16) | (g << 8) | b;
-            }
-            // Foreground color if specified (4 bytes: B, G, R, padding)
-            if (fgSpec) {
-                int b = src.readUnsignedByte();
-                int g = src.readUnsignedByte();
-                int r = src.readUnsignedByte();
-                src.readUnsignedByte(); // padding
-                hextileFg = 0xFF000000 | (r << 16) | (g << 8) | b;
-            }
-            // Fill with background
-            java.util.Arrays.fill(pixels, hextileBg);
-            // Subrectangles
-            if (anySubrects) {
-                int nSubrects = src.readUnsignedByte();
-                for (int i = 0; i < nSubrects; i++) {
-                    int color = hextileFg;
-                    if (subrectsColored) {
-                        // Colored subrect: 4 bytes (B, G, R, padding)
-                        int b = src.readUnsignedByte();
-                        int g = src.readUnsignedByte();
-                        int r = src.readUnsignedByte();
-                        src.readUnsignedByte(); // padding
-                        color = 0xFF000000 | (r << 16) | (g << 8) | b;
-                    }
-                    // xy: packed (x<<4)|y
-                    int xy = src.readUnsignedByte();
-                    // wh: packed ((w-1)<<4)|(h-1)
-                    int wh = src.readUnsignedByte();
-                    int sx = (xy >> 4) & 0xF;
-                    int sy = xy & 0xF;
-                    int sw = ((wh >> 4) & 0xF) + 1;
-                    int sh = (wh & 0xF) + 1;
-                    for (int row = sy; row < sy + sh && row < h; row++) {
-                        for (int col = sx; col < sx + sw && col < w; col++) {
-                            pixels[row * w + col] = color;
-                        }
-                    }
+        } catch (Exception e) { throw new IOException("ZLIB: " + e.getMessage()); }
+        // Optimized: use pixelBuffer and setPixels row by row
+        synchronized (framebuffer) {
+            for (int i = 0; i < h; i++) {
+                for (int j = 0; j < w; j++) {
+                    int idx = (i * w + j) * 4;
+                    pixelBuffer[j] = 0xFF000000
+                            | ((raw[idx]   & 0xFF) << 16)
+                            | ((raw[idx+1] & 0xFF) << 8)
+                            |  (raw[idx+2] & 0xFF);
                 }
+                framebuffer.setPixels(pixelBuffer, 0, w, x, y + i, w, 1);
             }
         }
-        if (framebuffer != null) synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
+        framebufferDirty = true;
+        zlibInflater.reset(); // Reset after each rect for safety
     }
 
+    private volatile boolean framebufferDirty = false;
+    
     // ─── Render ────────────────────────────────────────────────────────────────
 
     private void renderFrame() {
-        if (framebuffer == null || surfaceHolder == null) {
-            Log.w(TAG, "renderFrame skipped: framebuffer=" + (framebuffer == null) + 
-                  ", surfaceHolder=" + (surfaceHolder == null));
-            return;
-        }
+        if (framebuffer == null || surfaceHolder == null || !framebufferDirty) return;
+        framebufferDirty = false; // Reset dirty flag
+        
         Canvas canvas = null;
         try {
             canvas = surfaceHolder.lockCanvas();
-            if (canvas == null) {
-                Log.w(TAG, "renderFrame: canvas is null");
-                return;
-            }
-            Log.d(TAG, "renderFrame: canvas=" + canvas.getWidth() + "x" + canvas.getHeight() + 
-                  ", framebuffer=" + framebuffer.getWidth() + "x" + framebuffer.getHeight());
+            if (canvas == null) return;
             synchronized (framebuffer) {
-                // Draw the framebuffer scaled to canvas size
                 canvas.drawBitmap(framebuffer, null,
                         new Rect(0, 0, canvas.getWidth(), canvas.getHeight()), null);
-                
-                // Draw FPS counter in top-left corner (green text indicator)
-                android.graphics.Paint paint = new android.graphics.Paint();
-                paint.setColor(0xFF00FF00); // Green
-                paint.setTextSize(48);
-                paint.setStyle(android.graphics.Paint.Style.FILL);
-                canvas.drawText("VeyonMobile: " + fpsCount + " fps", 20, 60, paint);
             }
         } finally {
-            if (canvas != null) {
+            if (canvas != null)
                 try { surfaceHolder.unlockCanvasAndPost(canvas); } catch (Exception ignored) {}
-            }
         }
     }
 
     // ─── Feature Messages ──────────────────────────────────────────────────────
 
-    private void handleFeatureMessage(byte[] fmData) throws IOException {
+    private void handleFeatureMessage(byte[] fmData) {
         try {
-            java.io.DataInputStream dis = new java.io.DataInputStream(
-                new java.io.ByteArrayInputStream(fmData));
-            
-            // Read feature UID
-            int uidType = dis.readInt();
-            dis.readUnsignedByte(); // isNull
-            long data1 = dis.readInt();
-            int data2 = dis.readUnsignedShort();
-            int data3 = dis.readUnsignedShort();
+            java.io.DataInputStream d = new java.io.DataInputStream(
+                    new java.io.ByteArrayInputStream(fmData));
+            d.readInt(); d.readUnsignedByte(); // UUID type + isNull
+            int data1 = d.readInt();
+            int data2 = d.readUnsignedShort();
+            int data3 = d.readUnsignedShort();
             byte[] data4 = new byte[8];
-            dis.readFully(data4);
+            d.readFully(data4);
+            String uid = String.format("%08x-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x",
+                    data1, data2, data3,
+                    data4[0], data4[1], data4[2], data4[3],
+                    data4[4], data4[5], data4[6], data4[7]);
+            d.readInt(); d.readUnsignedByte();
+            int cmd = d.readInt();
+            Log.d(TAG, "FeatureMsg: " + uid + " cmd=" + cmd);
             
-            // Convert to UUID string
-            String featureUid = String.format("%08x-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x",
-                (int)data1, data2, data3,
-                data4[0], data4[1], data4[2], data4[3],
-                data4[4], data4[5], data4[6], data4[7]);
-            
-            // Read command
-            int cmdType = dis.readInt();
-            dis.readUnsignedByte();
-            int command = dis.readInt();
-            
-            // Read arguments map
-            int mapType = dis.readInt();
-            dis.readUnsignedByte();
-            int mapCount = dis.readInt();
-            
-            Log.d(TAG, "FeatureMessage: uid=" + featureUid + " cmd=" + command + " args=" + mapCount);
-            
-            // Respond to ALL feature queries from server
-            if (featureUid.equals(FEATURE_MONITORING_MODE)) {
-                Log.d(TAG, "Responding to MonitoringMode feature with cmd=" + command);
-                sendSimpleFeatureReply(featureUid, 0);
-                Log.d(TAG, "MonitoringMode response sent");
-            } else if (featureUid.equals(FEATURE_QUERY_ACTIVE)) {
-                Log.d(TAG, "Responding to QueryActiveFeatures");
-                // Respond with list of active features
-                sendFeatureReplyWithList(featureUid, 2, "activeFeatures",
-                    "edad8259-b4ef-4ca5-90e6-f238d0fda694");
-            } else if (featureUid.equals(FEATURE_USER_INFO)) {
-                Log.d(TAG, "Responding to UserInfo");
-                sendFeatureReplyWithMap(featureUid, 2,
-                    "userLoginName", "veyon-user",
-                    "userFullName", "Veyon User");
-            } else if (featureUid.equals(FEATURE_SESSION_INFO)) {
-                Log.d(TAG, "Responding to SessionInfo");
-                sendFeatureReplyWithMap(featureUid, 2,
-                    "sessionClientName", "veyon-mobile");
-            } else if (featureUid.equals(FEATURE_QUERY_SCREENS)) {
-                Log.d(TAG, "Responding to QueryScreens");
-                sendFeatureReplyWithList(featureUid, 2, "screens",
-                    "{\"name\":\"Screen 1\",\"width\":1920,\"height\":1080}");
+            // Respond to all feature queries to keep server happy
+            if (FEATURE_MONITORING_MODE.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_QUERY_ACTIVE.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_USER_INFO.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_SESSION_INFO.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_QUERY_SCREENS.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
             }
-            
         } catch (Exception e) {
-            Log.e(TAG, "Failed to handle feature message: " + e.getMessage(), e);
+            Log.w(TAG, "handleFeatureMessage: " + e.getMessage());
         }
-    }
-    
-    // Send a simple feature reply with just UUID and command (no arguments)
-    private void sendSimpleFeatureReply(String featureUid, int command) throws IOException {
-        if (out == null) return;
-        
-        // Convert UUID to bytes
-        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
-        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
-        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
-        byte[] data4 = new byte[8];
-        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
-        for (int i = 0; i < 8; i++) {
-            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
-        }
-        
-        // payloadSize = UUID(21) + Command(9) + EmptyMap(9) = 39 bytes
-        int payloadSize = 39;
-        
-        // Write message type byte FIRST (0x29 = FeatureMessage)
-        out.writeByte(MSG_VEYON_FEATURE);
-        
-        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
-        buf.order(ByteOrder.BIG_ENDIAN);
-        
-        buf.putInt(payloadSize);
-        
-        // UUID - type=30, isNull=0, 16 bytes
-        buf.putInt(30);
-        buf.put((byte) 0);
-        buf.putInt((int) data1);
-        buf.putShort((short) data2);
-        buf.putShort((short) data3);
-        buf.put(data4);
-        
-        // Command - type=2, isNull=0, value
-        buf.putInt(QMT_INT);
-        buf.put((byte) 0);
-        buf.putInt(command);
-        
-        // Empty arguments map - type=8, isNull=0, count=0
-        buf.putInt(8);
-        buf.put((byte) 0);
-        buf.putInt(0);
-        
-        out.write(buf.array());
-        out.flush();
-        Log.d(TAG, "Sent simple feature reply: " + featureUid + " cmd=" + command);
-    }
-    
-    // Send feature reply with a map of string key-value pairs
-    private void sendFeatureReplyWithMap(String featureUid, int command, Object... args) throws IOException {
-        if (out == null || args.length % 2 != 0) return;
-        
-        // Convert UUID to bytes
-        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
-        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
-        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
-        byte[] data4 = new byte[8];
-        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
-        for (int i = 0; i < 8; i++) {
-            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
-        }
-        
-        // Build arguments map
-        java.util.Map<String, String> arguments = new java.util.HashMap<>();
-        for (int i = 0; i < args.length; i += 2) {
-            arguments.put((String)args[i], (String)args[i+1]);
-        }
-        
-        // Calculate payload size
-        int uuidSize = 21;
-        int cmdSize = 9;
-        int mapSize = 9; // type + isNull + count
-        for (java.util.Map.Entry<String, String> entry : arguments.entrySet()) {
-            String key = entry.getKey();
-            String value = entry.getValue();
-            mapSize += 9 + key.length() * 2; // key
-            mapSize += 9 + value.length() * 2; // value
-        }
-        
-        int payloadSize = uuidSize + cmdSize + mapSize;
-        
-        // Write message type byte FIRST (0x29 = FeatureMessage)
-        out.writeByte(MSG_VEYON_FEATURE);
-        
-        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
-        buf.order(ByteOrder.BIG_ENDIAN);
-        
-        buf.putInt(payloadSize);
-        
-        // UUID
-        buf.putInt(30);
-        buf.put((byte) 0);
-        buf.putInt((int) data1);
-        buf.putShort((short) data2);
-        buf.putShort((short) data3);
-        buf.put(data4);
-        
-        // Command
-        buf.putInt(QMT_INT);
-        buf.put((byte) 0);
-        buf.putInt(command);
-        
-        // Arguments map
-        buf.putInt(8);
-        buf.put((byte) 0);
-        buf.putInt(arguments.size());
-        
-        for (java.util.Map.Entry<String, String> entry : arguments.entrySet()) {
-            // Key as QString
-            String key = entry.getKey();
-            byte[] keyUtf16 = key.getBytes("UTF-16BE");
-            buf.putInt(10);
-            buf.put((byte) 0);
-            buf.putInt(keyUtf16.length);
-            buf.put(keyUtf16);
-            
-            // Value as QString
-            String value = entry.getValue();
-            byte[] valUtf16 = value.getBytes("UTF-16BE");
-            buf.putInt(10);
-            buf.put((byte) 0);
-            buf.putInt(valUtf16.length);
-            buf.put(valUtf16);
-        }
-        
-        out.write(buf.array());
-        out.flush();
-        Log.d(TAG, "Sent feature reply with map: " + featureUid);
-    }
-    
-    // Send feature reply with a list of strings
-    private void sendFeatureReplyWithList(String featureUid, int command, String listKey, String... items) throws IOException {
-        if (out == null) return;
-        
-        // Convert UUID to bytes
-        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
-        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
-        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
-        byte[] data4 = new byte[8];
-        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
-        for (int i = 0; i < 8; i++) {
-            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
-        }
-        
-        // Calculate payload size (simplified - just enough for the list)
-        int listDataSize = 0;
-        for (String item : items) {
-            listDataSize += 9 + item.length() * 2;
-        }
-        
-        int uuidSize = 21;
-        int cmdSize = 9;
-        int mapSize = 9 + (9 + listKey.length() * 2) + 9 + listDataSize;
-        
-        int payloadSize = uuidSize + cmdSize + mapSize;
-        
-        // Write message type byte FIRST (0x29 = FeatureMessage)
-        out.writeByte(MSG_VEYON_FEATURE);
-        
-        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
-        buf.order(ByteOrder.BIG_ENDIAN);
-        
-        buf.putInt(payloadSize);
-        
-        // UUID
-        buf.putInt(30);
-        buf.put((byte) 0);
-        buf.putInt((int) data1);
-        buf.putShort((short) data2);
-        buf.putShort((short) data3);
-        buf.put(data4);
-        
-        // Command
-        buf.putInt(QMT_INT);
-        buf.put((byte) 0);
-        buf.putInt(command);
-        
-        // Arguments map with 1 entry (the list)
-        buf.putInt(8);
-        buf.put((byte) 0);
-        buf.putInt(1);
-        
-        // Key (list name)
-        byte[] keyUtf16 = listKey.getBytes("UTF-16BE");
-        buf.putInt(10);
-        buf.put((byte) 0);
-        buf.putInt(keyUtf16.length);
-        buf.put(keyUtf16);
-        
-        // Value (list of strings as QVariantList)
-        buf.putInt(10); // QVariantList type
-        buf.put((byte) 0);
-        buf.putInt(items.length * 20); // Simplified size
-        
-        for (String item : items) {
-            // Each item as QString
-            byte[] itemUtf16 = item.getBytes("UTF-16BE");
-            buf.putInt(10);
-            buf.put((byte) 0);
-            buf.putInt(itemUtf16.length);
-            buf.put(itemUtf16);
-        }
-        
-        out.write(buf.array());
-        out.flush();
-        Log.d(TAG, "Sent feature reply with list: " + featureUid);
-    }
-    
-    private void sendFeatureMessageReply(String featureUid, int command, Object... args) throws IOException {
-        if (out == null) return;
-        if (args.length % 2 != 0 && args.length != 0) {
-            Log.w(TAG, "sendFeatureMessageReply: args must be even count");
-            return;
-        }
-        
-        // Convert UUID to bytes
-        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
-        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
-        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
-        byte[] data4 = new byte[8];
-        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
-        for (int i = 0; i < 8; i++) {
-            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
-        }
-        
-        // Build arguments map
-        java.util.Map<String, Object> arguments = new java.util.HashMap<>();
-        for (int i = 0; i < args.length; i += 2) {
-            arguments.put((String)args[i], args[i+1]);
-        }
-        
-        // Calculate payload size
-        int uuidSize = 21;
-        int cmdSize = 9;
-        int mapSize = 9; // type + isNull + count
-        for (java.util.Map.Entry<String, Object> entry : arguments.entrySet()) {
-            Object value = entry.getValue();
-            if (value instanceof String) {
-                String s = (String) value;
-                mapSize += 9 + s.length() * 2;
-            } else if (value instanceof java.util.List) {
-                mapSize += 9 + 9;
-            } else if (value instanceof java.util.Map) {
-                mapSize += 9 + 9;
-            }
-        }
-        
-        int payloadSize = uuidSize + cmdSize + mapSize;
-        
-        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
-        buf.order(ByteOrder.BIG_ENDIAN);
-        
-        buf.putInt(payloadSize);
-        
-        // UUID
-        buf.putInt(30);
-        buf.put((byte) 0);
-        buf.putInt((int) data1);
-        buf.putShort((short) data2);
-        buf.putShort((short) data3);
-        buf.put(data4);
-        
-        // Command
-        buf.putInt(QMT_INT);
-        buf.put((byte) 0);
-        buf.putInt(command);
-        
-        // Arguments map
-        buf.putInt(8);
-        buf.put((byte) 0);
-        buf.putInt(arguments.size());
-        
-        for (java.util.Map.Entry<String, Object> entry : arguments.entrySet()) {
-            // Key as QString
-            String key = entry.getKey();
-            byte[] keyUtf16 = key.getBytes("UTF-16BE");
-            buf.putInt(10);
-            buf.put((byte) 0);
-            buf.putInt(keyUtf16.length);
-            buf.put(keyUtf16);
-            
-            // Value
-            Object value = entry.getValue();
-            if (value instanceof String) {
-                String s = (String) value;
-                byte[] valUtf16 = s.getBytes("UTF-16BE");
-                buf.putInt(10);
-                buf.put((byte) 0);
-                buf.putInt(valUtf16.length);
-                buf.put(valUtf16);
-            } else if (value instanceof java.util.List) {
-                java.util.List<?> list = (java.util.List<?>) value;
-                buf.putInt(10);
-                buf.put((byte) 0);
-                buf.putInt(list.size() * 20);
-                for (Object item : list) {
-                    if (item instanceof java.util.Map) {
-                        java.util.Map<?, ?> map = (java.util.Map<?, ?>) item;
-                        buf.putInt(8);
-                        buf.put((byte) 0);
-                        buf.putInt(map.size());
-                        for (java.util.Map.Entry<?, ?> e : map.entrySet()) {
-                            String k = e.getKey().toString();
-                            byte[] kUtf16 = k.getBytes("UTF-16BE");
-                            buf.putInt(10);
-                            buf.put((byte) 0);
-                            buf.putInt(kUtf16.length);
-                            buf.put(kUtf16);
-                            String v = e.getValue().toString();
-                            byte[] vUtf16 = v.getBytes("UTF-16BE");
-                            buf.putInt(10);
-                            buf.put((byte) 0);
-                            buf.putInt(vUtf16.length);
-                            buf.put(vUtf16);
-                        }
-                    }
-                }
-            } else if (value instanceof java.util.Map) {
-                java.util.Map<?, ?> map = (java.util.Map<?, ?>) value;
-                buf.putInt(8);
-                buf.put((byte) 0);
-                buf.putInt(map.size());
-                for (java.util.Map.Entry<?, ?> e : map.entrySet()) {
-                    String k = e.getKey().toString();
-                    byte[] kUtf16 = k.getBytes("UTF-16BE");
-                    buf.putInt(10);
-                    buf.put((byte) 0);
-                    buf.putInt(kUtf16.length);
-                    buf.put(kUtf16);
-                    String v = e.getValue().toString();
-                    byte[] vUtf16 = v.getBytes("UTF-16BE");
-                    buf.putInt(10);
-                    buf.put((byte) 0);
-                    buf.putInt(vUtf16.length);
-                    buf.put(vUtf16);
-                }
-            }
-        }
-        
-        out.write(buf.array());
-        out.flush();
-        Log.d(TAG, "Sent feature reply: " + featureUid + " cmd=" + command);
     }
 
+    // FIX #3: sendFeatureMessage pubblico — chiamabile da VeyonVncModule
+    // Improved implementation using ByteArrayOutputStream for automatic sizing
     public synchronized void sendFeatureMessage(String featureUid, boolean active,
                                                 java.util.Map<String, String> arguments)
             throws IOException {
         if (out == null) return;
-
-        // Convert UUID string to 16 bytes (big-endian RFC 4122 format)
-        long data1 = Long.parseLong(featureUid.substring(0, 8), 16);
-        int data2 = Integer.parseInt(featureUid.substring(9, 13), 16);
-        int data3 = Integer.parseInt(featureUid.substring(14, 18), 16);
-        byte[] data4 = new byte[8];
-        String d4hex = featureUid.substring(19, 23) + featureUid.substring(24);
-        for (int i = 0; i < 8; i++) {
-            data4[i] = (byte) Integer.parseInt(d4hex.substring(i * 2, i * 2 + 2), 16);
-        }
-
-        // payloadSize = UUID(21) + Command(9) + Map(9) = 39 bytes
-        int payloadSize = 21 + 9 + 9;
-
-        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
-        buf.order(ByteOrder.BIG_ENDIAN);
-
-        buf.put((byte) MSG_VEYON_FEATURE);
-        buf.putInt(payloadSize);
-
-        // QVariant<QUuid> - type=30, isNull=0, then 16 bytes
-        buf.putInt(30);
-        buf.put((byte) 0);
-        buf.putInt((int) data1);
-        buf.putShort((short) data2);
-        buf.putShort((short) data3);
-        buf.put(data4);
-
-        // QVariant<Int> Command - use Command::Default = 0
-        buf.putInt(QMT_INT);
-        buf.put((byte) 0);
-        buf.putInt(0);
-
-        // QVariant<QVariantMap> - type=8, isNull=0, count=0
-        buf.putInt(8);
-        buf.put((byte) 0);
-        buf.putInt(0);
-
-        out.write(buf.array());
+        
+        // Build payload using ByteArrayOutputStream for automatic sizing
+        java.io.ByteArrayOutputStream payloadBAOS = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream payloadOut = new java.io.DataOutputStream(payloadBAOS);
+        
+        // A. Write UUID (QVariant type 30)
+        writeQVariantUUID(payloadOut, featureUid);
+        
+        // B. Write command (QVariant Int): 0 = Start, 1 = Stop
+        writeQVariantInt(payloadOut, active ? 0 : 1);
+        
+        // C. Write arguments map (QVariant type 8)
+        writeQVariantMap(payloadOut, arguments);
+        
+        byte[] payload = payloadBAOS.toByteArray();
+        
+        // Send final packet: [MsgID (1b)] [PayloadLen (4b)] [Payload (Nb)]
+        out.writeByte(MSG_VEYON_FEATURE);
+        out.writeInt(payload.length);
+        out.write(payload);
         out.flush();
-        Log.d(TAG, "Sent feature: " + featureUid);
+        Log.d(TAG, "sendFeatureMessage: " + featureUid + " active=" + active);
+    }
+
+    // sendFeatureMessage con argomenti stringa (per TextMessage, StartApp, OpenWebsite)
+    public synchronized void sendFeatureMessageWithArgs(String featureUid, boolean active,
+                                                        java.util.Map<String, String> args)
+            throws IOException {
+        // Just pass args to the main method
+        sendFeatureMessage(featureUid, active, args);
+    }
+    
+    // --- HELPER PER SERIALIZZAZIONE QVARIANT ---
+    
+    private void writeQVariantUUID(java.io.DataOutputStream out, String uid) throws IOException {
+        out.writeInt(QMT_UUID);
+        out.writeByte(0); // isNull = false
+        out.write(uuidToBytes(uid));
+    }
+    
+    private void writeQVariantInt(java.io.DataOutputStream out, int value) throws IOException {
+        out.writeInt(QMT_INT);
+        out.writeByte(0); // isNull = false
+        out.writeInt(value);
+    }
+    
+    private void writeQVariantMap(java.io.DataOutputStream out, java.util.Map<String, String> args) throws IOException {
+        out.writeInt(QMT_MAP);
+        out.writeByte(0); // isNull = false
+        
+        if (args == null || args.isEmpty()) {
+            out.writeInt(0); // Empty map
+        } else {
+            out.writeInt(args.size());
+            for (java.util.Map.Entry<String, String> entry : args.entrySet()) {
+                writeQString(out, entry.getKey());
+                writeQVariantString(out, entry.getValue());
+            }
+        }
+    }
+    
+    private void writeQVariantString(java.io.DataOutputStream out, String value) throws IOException {
+        out.writeInt(QMT_STRING);
+        out.writeByte(0);
+        writeQString(out, value);
+    }
+    
+    private void writeQString(java.io.DataOutputStream out, String s) throws IOException {
+        if (s == null) {
+            out.writeInt(0xFFFFFFFF); // Null string in Qt
+            return;
+        }
+        byte[] bytes = s.getBytes("UTF-16BE");
+        out.writeInt(bytes.length); // Length in bytes
+        out.write(bytes);
+    }
+
+    private void sendSimpleFeatureReply(String featureUid, int command) throws IOException {
+        if (out == null) return;
+        sendFeatureMessage(featureUid, command == 0, null);
+    }
+
+    private byte[] uuidToBytes(String uid) {
+        // RFC 4122 binary: data1(4) data2(2) data3(2) data4(8)
+        long data1 = Long.parseLong(uid.substring(0, 8), 16);
+        int  data2 = Integer.parseInt(uid.substring(9, 13), 16);
+        int  data3 = Integer.parseInt(uid.substring(14, 18), 16);
+        byte[] data4 = new byte[8];
+        String d4 = uid.substring(19, 23) + uid.substring(24);
+        for (int i = 0; i < 8; i++)
+            data4[i] = (byte) Integer.parseInt(d4.substring(i*2, i*2+2), 16);
+        ByteBuffer b = ByteBuffer.allocate(16);
+        b.order(ByteOrder.BIG_ENDIAN);
+        b.putInt((int) data1);
+        b.putShort((short) data2);
+        b.putShort((short) data3);
+        b.put(data4);
+        return b.array();
     }
 
     // ─── Utility ───────────────────────────────────────────────────────────────
 
-    private String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder();
-        for (byte b : bytes) sb.append(String.format("%02X ", b));
-        return sb.toString();
-    }
-
-    private String buildDetailedErrorMessage(Exception e) {
-        String msg = e.getMessage();
-        if (msg != null && !msg.trim().isEmpty()) return msg;
-        return e.getClass().getSimpleName();
-    }
-
     private boolean hasEofInChain(Throwable t) {
+        while (t != null) { if (t instanceof java.io.EOFException) return true; t = t.getCause(); }
+        return false;
+    }
+
+    private boolean hasSocketResetInChain(Throwable t) {
         while (t != null) {
-            if (t instanceof java.io.EOFException) return true;
+            if (t instanceof java.net.SocketException) {
+                String m = t.getMessage();
+                if (m != null && m.toLowerCase().contains("reset")) return true;
+            }
             t = t.getCause();
         }
         return false;
@@ -1619,50 +873,5 @@ public class VeyonVncClient {
 
     private void closeSocketQuietly() {
         try { if (socket != null) socket.close(); } catch (Exception ignored) {}
-    }
-
-    private boolean hasSocketResetInChain(Throwable t) {
-        while (t != null) {
-            if (t instanceof java.net.SocketException) {
-                String msg = t.getMessage();
-                if (msg != null && msg.toLowerCase().contains("reset")) return true;
-            }
-            t = t.getCause();
-        }
-        return false;
-    }
-
-    private void logFeatureMessageSummary(byte[] payload) {
-        try {
-            java.io.DataInputStream dis = new java.io.DataInputStream(
-                    new java.io.ByteArrayInputStream(payload));
-
-            int uidType = dis.readInt();
-            int uidNull = dis.readUnsignedByte();
-            if (uidType != 30 || uidNull != 0) {
-                Log.d(TAG, "FeatureMessage payload unexpected UID variant: type=" + uidType + " null=" + uidNull);
-                return;
-            }
-
-            int data1 = dis.readInt();
-            int data2 = dis.readUnsignedShort();
-            int data3 = dis.readUnsignedShort();
-            byte[] data4 = new byte[8];
-            dis.readFully(data4);
-            String featureUid = String.format("%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                    data1, data2, data3,
-                    data4[0] & 0xFF, data4[1] & 0xFF,
-                    data4[2] & 0xFF, data4[3] & 0xFF, data4[4] & 0xFF,
-                    data4[5] & 0xFF, data4[6] & 0xFF, data4[7] & 0xFF);
-
-            int cmdType = dis.readInt();
-            int cmdNull = dis.readUnsignedByte();
-            int cmd = dis.readInt();
-
-            Log.d(TAG, "FeatureMessage summary: uid=" + featureUid +
-                    " cmdType=" + cmdType + " cmdNull=" + cmdNull + " cmd=" + cmd);
-        } catch (Exception ex) {
-            Log.d(TAG, "FeatureMessage summary parse failed: " + ex.getMessage());
-        }
     }
 }

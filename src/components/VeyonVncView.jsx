@@ -37,6 +37,14 @@ const VeyonVncView = ({
   useEffect(() => { onDisconnectedRef.current = onDisconnected; }, [onDisconnected]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
+  // Expose sendFeature method for parent components
+  useEffect(() => {
+    VeyonVncView.sendFeature = async (featureUid, active, args = null) => {
+      if (!VeyonVncModule) throw new Error('VeyonVncModule not available');
+      return await VeyonVncModule.sendFeature(featureUid, active, args);
+    };
+  }, []);
+
   const doConnect = useCallback(() => {
     if (!surfaceReady.current || !host || !keyName || !privateKey) {
       console.log('VNC doConnect skipped — not ready:', { surfaceReady: surfaceReady.current, host, hasKey: !!keyName, hasPriv: !!privateKey });

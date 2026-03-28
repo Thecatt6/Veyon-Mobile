@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { View, StyleSheet, Alert, Dimensions, ScrollView, Image } from 'react-native';
+import { View, StyleSheet, Alert, Dimensions, ScrollView, Image, NativeModules } from 'react-native';
 import { Text, useTheme, Appbar, Button, ActivityIndicator, Chip, Dialog, Portal, TextInput } from 'react-native-paper';
 import { Canvas, Image as SkiaImage } from '@shopify/react-native-skia';
 import { authenticate, getSessionUser, getFeatures, setFeature } from '../controllers/VeyonAPI';
@@ -7,6 +7,8 @@ import { getAuthKeys, getSettings } from '../controllers/StorageController';
 import { startFramePoller } from '../controllers/MJPEGStream';
 import NativeSurfaceView from '../components/NativeSurfaceView';
 import VeyonVncView from '../components/VeyonVncView';
+
+const { VeyonVncModule } = NativeModules;
 
 // ─── Feature metadata ──────────────────────────────────────────────────────────
 const FEATURE_META = {
@@ -51,6 +53,41 @@ const FEATURE_META = {
   'AccessControlProvider':      { label: '🔐 Access Control' },
 };
 
+// Feature UUID map per VNC (name → uid)
+const FEATURE_UIDS = {
+  'ScreenLock':                 'ccb535a2-1d24-4cc1-a709-8b47d2b2ac79',
+  'InputDevicesLock':           'e4a77879-e544-4fec-bc18-e534f33b934c',
+  'RemoteView':                 'a18e545b-1321-4d4e-ac34-adc421c6e9c8',
+  'RemoteControl':              'ca00ad68-1709-4abe-85e2-48dff6ccf8a2',
+  'FullScreenDemo':             '7b6231bd-eb89-45d3-af32-f70663b2f878',
+  'WindowDemo':                 'ae45c3db-dc2e-4204-ae8b-374cdab8c62c',
+  'ShareOwnScreenFullScreen':   '07b375e1-8ab6-4b48-bcb7-75fb3d56035b',
+  'ShareOwnScreenWindow':       '68c55fb9-127e-4c9f-9c90-28b998bf1a47',
+  'ShareUserScreenFullScreen':  'b4e542e2-1deb-48ac-910a-bbf8ac9a0bde',
+  'ShareUserScreenWindow':      'ebfc5ec4-f725-4bfc-a93a-c6d4864c6806',
+  'MonitoringMode':             'edad8259-b4ef-4ca5-90e6-f238d0fda694',
+  'ClipboardExchange':          '8fa73e19-3d66-4d59-9783-c2a1bb07e20e',
+  'UserLogin':                  '7310707d-3918-460d-a949-65bd152cb958',
+  'UserLogoff':                 '7311d43d-ab53-439e-a03a-8cb25f7ed526',
+  'Reboot':                     '4f7d98f0-395a-4fff-b968-e49b8d0f748c',
+  'PowerDown':                  '6f5a27a0-0e2f-496e-afcc-7aae62eede10',
+  'PowerDownNow':               'a88039f2-6716-40d8-b4e1-9f5cd48e91ed',
+  'InstallUpdatesAndPowerDown': '09bcb3a1-fc11-4d03-8cf1-efd26be8655b',
+  'PowerDownConfirmed':         'ea2406be-d5c7-42b8-9f04-53469d3cc34c',
+  'PowerDownDelayed':           '352de795-7fc4-4850-bc57-525bcb7033f5',
+  'TextMessage':                'e75ae9c8-ac17-4d00-8f0d-019348346208',
+  'StartApp':                   'da9ca56a-b2ad-4fff-8f8a-929b2927b442',
+  'OpenWebsite':                '8a11a75d-b3db-48b6-b9cb-f8422ddd5b0c',
+  'Screenshot':                 'd5ee3aac-2a87-4d05-b827-0c20344490bd',
+};
+
+// Features predefinite per VNC (quando WebAPI non è disponibile)
+const VNC_FEATURES = Object.keys(FEATURE_UIDS).map(name => ({
+  name,
+  uid: FEATURE_UIDS[name],
+  active: false,
+}));
+
 const INPUT_CONFIG = {
   text:  { title: '💬 Message to send',  placeholder: 'Type your message…', multiline: true },
   url:   { title: '🌐 Website URL',       placeholder: 'https://example.com',multiline: false },
@@ -64,7 +101,6 @@ function getMeta(feature) {
 
 const RENDERER_LABELS = { image: '🖼️ Image', skia: '⚡ Skia', native: '🚀 Native' };
 
-// ─── Component ────────────────────────────────────────────────────────────────
 const ComputerDetailScreen = ({ route, navigation }) => {
   const theme = useTheme();
   const { computer } = route.params;
@@ -79,52 +115,47 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   const [inputValue, setInputValue] = useState('');
   const [inputPassword, setInputPassword] = useState('');
 
-  // ── Renderer state ───────────────────────────────────────────────────────────
   const [renderer, setRenderer] = useState('image');
-  const [connectionMethod, setConnectionMethod] = useState('webapi'); // 'webapi' | 'vnc'
+  const [connectionMethod, setConnectionMethod] = useState('webapi');
+  const [featureMethod, setFeatureMethod] = useState('webapi');
   const [frameQuality, setFrameQuality] = useState(50);
   const [frameCompression, setFrameCompression] = useState(8);
   const [vncPort, setVncPort] = useState(11100);
-  const [frameThrottleMs, setFrameThrottleMs] = useState(100);
 
-  // Frame state for each renderer
-  const [imageFrame, setImageFrame] = useState(null);   // base64 URI
-  const [skiaFrame, setSkiaFrame] = useState(null);     // SkiaImage object
-  const [nativeFrame, setNativeFrame] = useState(null); // base64 URI for NativeSurfaceView
+  const [imageFrame, setImageFrame] = useState(null);
+  const [skiaFrame, setSkiaFrame] = useState(null);
+  const [nativeFrame, setNativeFrame] = useState(null);
+  const [vncAuthKey, setVncAuthKey] = useState(null); // { keyName, privateKey }
 
   const sessionRef = useRef(null);
-  const authKeyRef = useRef(null); // { keyName, privateKey } per VNC
   const mountedRef = useRef(true);
   const cancelStreamRef = useRef(null);
   const fpsCountRef = useRef(0);
   const fpsTimerRef = useRef(null);
   const lastFrameTimeRef = useRef(0);
-  const FRAME_INTERVAL = 80; // ~12 FPS UI throttle
+  const FRAME_INTERVAL = 80;
 
   const baseURL = `http://${computer.ip}:${computer.port}`;
   const { width: W, height: H } = Dimensions.get('window');
   const frameHeight = Math.round(H * 0.6);
 
-  // ── Load settings on mount ────────────────────────────────────────────────
   useEffect(() => {
     getSettings().then((s) => {
       setRenderer(s.renderer || 'image');
       setConnectionMethod(s.connectionMethod || 'webapi');
+      setFeatureMethod(s.featureMethod || 'webapi');
       setFrameQuality(s.frameQuality || 50);
       setFrameCompression(s.frameCompression || 8);
       setVncPort(s.vncPort || 11100);
-      setFrameThrottleMs(s.frameThrottleMs ?? 100);
     });
   }, []);
 
-  // ── FPS counter ───────────────────────────────────────────────────────────
   const startFPSCounter = useCallback(() => {
     fpsTimerRef.current = setInterval(() => {
       if (mountedRef.current) { setFps(fpsCountRef.current); fpsCountRef.current = 0; }
     }, 1000);
   }, []);
 
-  // ── Re-auth ───────────────────────────────────────────────────────────────
   const reAuth = useCallback(async () => {
     const keys = await getAuthKeys();
     for (const key of Object.values(keys)) {
@@ -133,12 +164,11 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         if (!mountedRef.current) return null;
         sessionRef.current = session;
         return session.connectionUid;
-      } catch { /* try next */ }
+      } catch { }
     }
     return null;
   }, [computer]);
 
-  // ── Load features ─────────────────────────────────────────────────────────
   const loadFeatures = useCallback(async (uid, retries = 3) => {
     const targetUid = uid || sessionRef.current?.connectionUid;
     if (!targetUid) return;
@@ -154,26 +184,19 @@ const ComputerDetailScreen = ({ route, navigation }) => {
     }
   }, [baseURL]);
 
-  // ── Start stream ──────────────────────────────────────────────────────────
   const startStream = useCallback((connectionUid, rendererMode, quality, compression) => {
     cancelStreamRef.current?.();
     cancelStreamRef.current = startFramePoller(
       baseURL, connectionUid,
       (frame) => {
         if (!mountedRef.current) return;
-        // Throttle UI updates
         const now = Date.now();
         if (now - lastFrameTimeRef.current < FRAME_INTERVAL) return;
         lastFrameTimeRef.current = now;
         fpsCountRef.current += 1;
-
-        if (rendererMode === 'skia' && typeof frame === 'object') {
-          setSkiaFrame(frame);
-        } else if (rendererMode === 'native') {
-          setNativeFrame(frame);
-        } else {
-          setImageFrame({ uri: frame });
-        }
+        if (rendererMode === 'skia' && typeof frame === 'object') setSkiaFrame(frame);
+        else if (rendererMode === 'native') setNativeFrame(frame);
+        else setImageFrame({ uri: frame });
       },
       (err) => console.warn('Frame error:', err),
       reAuth,
@@ -181,7 +204,6 @@ const ComputerDetailScreen = ({ route, navigation }) => {
     );
   }, [baseURL, reAuth]);
 
-  // ── Init ──────────────────────────────────────────────────────────────────
   const initialize = useCallback(async () => {
     const [keys, s] = await Promise.all([getAuthKeys(), getSettings()]);
     const keyList = Object.values(keys);
@@ -190,38 +212,45 @@ const ComputerDetailScreen = ({ route, navigation }) => {
     const c = s.frameCompression || 8;
     const vp = s.vncPort || 11100;
     const method = s.connectionMethod || 'webapi';
-    const throttle = s.frameThrottleMs ?? 100;
+    const fm = s.featureMethod || 'webapi';
 
     setRenderer(r);
     setFrameQuality(q);
     setFrameCompression(c);
     setVncPort(vp);
     setConnectionMethod(method);
-    setFrameThrottleMs(throttle);
+    setFeatureMethod(fm);
 
     if (keyList.length === 0) { setStatus('no-auth'); return; }
 
-    // VNC mode: use VNC for display but still auth with WebAPI for features
+    // VNC mode
     if (method === 'vnc') {
-      // Load the key for VeyonVncView
-      if (keyList.length > 0) {
-        authKeyRef.current = { keyName: keyList[0].keyName, privateKey: keyList[0].privateKey };
-      }
-      // Also try WebAPI auth for features (non-blocking)
+      const k = keyList[0];
+      setVncAuthKey({ keyName: k.keyName, privateKey: k.privateKey });
+
+      // Carica features: prima prova WebAPI, poi fallback a lista statica VNC
+      let featuresLoaded = false;
       for (const key of keyList) {
         try {
           const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
           if (!mountedRef.current) return;
           sessionRef.current = session;
-          setTimeout(() => loadFeatures(session.connectionUid), 800);
+          await loadFeatures(session.connectionUid);
+          featuresLoaded = true;
           break;
-        } catch (e) { console.log('WebAPI auth (optional):', e?.message); }
+        } catch (e) {
+          console.log('WebAPI auth (optional for features):', e?.message);
+        }
+      }
+      // Se WebAPI non disponibile, usa lista statica per VNC features
+      if (!featuresLoaded && mountedRef.current) {
+        setFeatures(VNC_FEATURES);
       }
       if (mountedRef.current) setStatus('live');
       return;
     }
 
-    // WebAPI mode: autenticazione + stream HTTP
+    // WebAPI mode
     for (const key of keyList) {
       try {
         const session = await authenticate(computer.authURL, key.keyName, key.privateKey);
@@ -230,7 +259,7 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         try {
           const user = await getSessionUser(baseURL, session.connectionUid);
           if (mountedRef.current) setUserLabel(user || '');
-        } catch { /* non-blocking */ }
+        } catch { }
         startStream(session.connectionUid, r, q, c);
         if (mountedRef.current) setStatus('live');
         setTimeout(() => loadFeatures(session.connectionUid), 800);
@@ -251,25 +280,44 @@ const ComputerDetailScreen = ({ route, navigation }) => {
     };
   }, []);
 
-  // ── Feature execution ─────────────────────────────────────────────────────
+  // ── Esegui feature ───────────────────────────────────────────────────────────
   const executeFeature = useCallback(async (feature, args = {}) => {
-    if (!sessionRef.current) return;
     const meta = getMeta(feature);
     const newActive = meta.toggle ? !feature.active : true;
+
     if (meta.toggle) {
       setFeatures(prev => prev.map(f => f.uid === feature.uid ? { ...f, active: newActive } : f));
     }
     setLoadingFeature(feature.uid);
+
     try {
-      await setFeature(baseURL, sessionRef.current.connectionUid, feature.uid, newActive, args);
-      await loadFeatures(sessionRef.current.connectionUid, 1);
+      const method = featureMethod || connectionMethod;
+
+      if (method === 'vnc') {
+        // Usa VNC per eseguire la feature
+        // Ottieni UID della feature: usa quello che abbiamo o cerca nella mappa
+        const uid = feature.uid || FEATURE_UIDS[feature.name];
+        if (!uid) throw new Error(`Unknown feature UID for: ${feature.name}`);
+
+        // Converti args in formato corretto
+        const argsMap = Object.keys(args).length > 0 ? args : {};
+        await VeyonVncModule.sendFeature(uid, newActive, argsMap);
+
+      } else {
+        // Usa WebAPI
+        if (!sessionRef.current) throw new Error('No WebAPI session');
+        await setFeature(baseURL, sessionRef.current.connectionUid, feature.uid, newActive, args);
+        await loadFeatures(sessionRef.current.connectionUid, 1);
+      }
     } catch (err) {
       if (meta.toggle) {
         setFeatures(prev => prev.map(f => f.uid === feature.uid ? { ...f, active: feature.active } : f));
       }
       Alert.alert('Error', err?.response?.data?.error?.message || err?.message || 'Unknown error');
-    } finally { setLoadingFeature(null); }
-  }, [baseURL, loadFeatures]);
+    } finally {
+      setLoadingFeature(null);
+    }
+  }, [baseURL, loadFeatures, connectionMethod, featureMethod]);
 
   const handleFeaturePress = useCallback((feature) => {
     const meta = getMeta(feature);
@@ -289,29 +337,21 @@ const ComputerDetailScreen = ({ route, navigation }) => {
     if (!inputDialog) return;
     const { feature, inputKey } = inputDialog;
     let args = {};
-
     if (inputKey === 'text') {
       if (!inputValue.trim()) return;
       args = { text: inputValue.trim() };
-
     } else if (inputKey === 'url') {
       if (!inputValue.trim()) return;
       let url = inputValue.trim();
       if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'https://' + url;
-      // Veyon expects 'url' inside arguments
       args = { url };
-
     } else if (inputKey === 'app') {
       if (!inputValue.trim()) return;
-      // Veyon expects 'executable' inside arguments
       args = { executable: inputValue.trim() };
-
     } else if (inputKey === 'login') {
       if (!inputValue.trim()) return;
-      // Veyon UserLogin expects username and password
       args = { username: inputValue.trim(), password: inputPassword };
     }
-
     setInputDialog(null);
     setInputValue('');
     setInputPassword('');
@@ -321,17 +361,25 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   const s = styles(theme);
   const hasFrame = imageFrame || skiaFrame || nativeFrame || connectionMethod === 'vnc';
 
-  // ── Render framebuffer based on settings ────────────────────────────────────
   const renderFrame = () => {
     if (connectionMethod === 'vnc') {
+      if (!vncAuthKey) {
+        return (
+          <View style={[s.framePlaceholder, { width: W, height: frameHeight, backgroundColor: '#000' }]}>
+            <ActivityIndicator color={theme.colors.primary} size="large" />
+            <Text style={s.placeholderText}>Loading key…</Text>
+          </View>
+        );
+      }
       return (
         <VeyonVncView
           host={computer.ip}
           port={vncPort}
-          keyName={authKeyRef.current?.keyName || ''}
-          privateKey={authKeyRef.current?.privateKey || ''}
+          keyName={vncAuthKey.keyName}
+          privateKey={vncAuthKey.privateKey}
           style={{ width: W, height: frameHeight }}
           onConnected={() => { if (mountedRef.current) setStatus('live'); }}
+          onFpsUpdate={(f) => { if (mountedRef.current) setFps(f); }}
           onError={(e) => console.warn('VNC error:', e)}
         />
       );
@@ -344,20 +392,15 @@ const ComputerDetailScreen = ({ route, navigation }) => {
       );
     }
     if (renderer === 'native' && nativeFrame) {
-      return (
-        <NativeSurfaceView
-          frameBase64={nativeFrame}
-          style={{ width: W, height: frameHeight }}
-        />
-      );
+      return <NativeSurfaceView frameBase64={nativeFrame} style={{ width: W, height: frameHeight }} />;
     }
     if (imageFrame) {
-      return (
-        <Image source={imageFrame} style={{ width: W, height: frameHeight }} resizeMode="contain" fadeDuration={0} />
-      );
+      return <Image source={imageFrame} style={{ width: W, height: frameHeight }} resizeMode="contain" fadeDuration={0} />;
     }
     return null;
   };
+
+  const canShowActions = features.length > 0;
 
   return (
     <View style={s.container}>
@@ -376,13 +419,12 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         )}
         <Appbar.Action
           icon="lightning-bolt"
-          iconColor={features.length > 0 ? theme.colors.primary : theme.colors.onSurfaceVariant}
+          iconColor={canShowActions ? theme.colors.primary : theme.colors.onSurfaceVariant}
           onPress={() => setActionsVisible(true)}
-          disabled={features.length === 0}
+          disabled={!canShowActions}
         />
       </Appbar.Header>
 
-      {/* Framebuffer */}
       <View style={[s.frameContainer, { height: frameHeight }]}>
         {hasFrame ? renderFrame() : (
           <View style={s.framePlaceholder}>
@@ -403,41 +445,33 @@ const ComputerDetailScreen = ({ route, navigation }) => {
       </View>
 
       <Portal>
-        {/* Actions dialog */}
         <Dialog visible={actionsVisible} onDismiss={() => setActionsVisible(false)} style={{ backgroundColor: theme.colors.surface }}>
           <Dialog.Title style={{ color: theme.colors.onSurface }}>
             Actions — {computer.label || computer.ip}
+            {featureMethod === 'vnc' ? ' (VNC)' : ' (WebAPI)'}
           </Dialog.Title>
           <Dialog.ScrollArea style={{ maxHeight: 440 }}>
             <ScrollView contentContainerStyle={{ padding: 8 }}>
-              {features.length === 0 ? (
-                <View style={{ padding: 24, alignItems: 'center' }}>
-                  <Text style={{ color: theme.colors.onSurfaceVariant, textAlign: 'center' }}>
-                    No features available.{'\n'}Make sure the Veyon service is running on the remote computer.
-                  </Text>
-                </View>
-              ) : (
-                <View style={s.actionsGrid}>
-                  {features.map((feature) => {
-                    const meta = getMeta(feature);
-                    const isActive = meta.toggle && feature.active;
-                    return (
-                      <Button
-                        key={feature.uid}
-                        mode={isActive ? 'contained' : 'outlined'}
-                        style={[s.actionButton, meta.notSupported && { opacity: 0.5 }]}
-                        labelStyle={s.actionLabel}
-                        loading={loadingFeature === feature.uid}
-                        disabled={loadingFeature !== null}
-                        onPress={() => { setActionsVisible(false); setTimeout(() => handleFeaturePress(feature), 150); }}
-                        compact
-                      >
-                        {meta.label}
-                      </Button>
-                    );
-                  })}
-                </View>
-              )}
+              <View style={s.actionsGrid}>
+                {features.map((feature) => {
+                  const meta = getMeta(feature);
+                  const isActive = meta.toggle && feature.active;
+                  return (
+                    <Button
+                      key={feature.uid || feature.name}
+                      mode={isActive ? 'contained' : 'outlined'}
+                      style={[s.actionButton, meta.notSupported && { opacity: 0.5 }]}
+                      labelStyle={s.actionLabel}
+                      loading={loadingFeature === feature.uid}
+                      disabled={loadingFeature !== null}
+                      onPress={() => { setActionsVisible(false); setTimeout(() => handleFeaturePress(feature), 150); }}
+                      compact
+                    >
+                      {meta.label}
+                    </Button>
+                  );
+                })}
+              </View>
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
@@ -445,7 +479,6 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           </Dialog.Actions>
         </Dialog>
 
-        {/* Input dialog */}
         <Dialog visible={inputDialog !== null} onDismiss={() => { setInputDialog(null); setInputValue(''); setInputPassword(''); }} style={{ backgroundColor: theme.colors.surface }}>
           <Dialog.Title style={{ color: theme.colors.onSurface }}>
             {inputDialog ? INPUT_CONFIG[inputDialog.inputKey]?.title : ''}
@@ -453,47 +486,23 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           <Dialog.Content>
             {inputDialog?.inputKey === 'login' ? (
               <>
-                <TextInput
-                  mode="outlined"
-                  label="Username"
-                  value={inputValue}
-                  onChangeText={setInputValue}
-                  autoFocus
-                  autoCapitalize="none"
-                  style={{ backgroundColor: theme.colors.surfaceVariant, marginBottom: 12 }}
-                />
-                <TextInput
-                  mode="outlined"
-                  label="Password"
-                  value={inputPassword}
-                  onChangeText={setInputPassword}
-                  secureTextEntry
-                  style={{ backgroundColor: theme.colors.surfaceVariant }}
-                />
+                <TextInput mode="outlined" label="Username" value={inputValue} onChangeText={setInputValue}
+                  autoFocus autoCapitalize="none" style={{ backgroundColor: theme.colors.surfaceVariant, marginBottom: 12 }} />
+                <TextInput mode="outlined" label="Password" value={inputPassword} onChangeText={setInputPassword}
+                  secureTextEntry style={{ backgroundColor: theme.colors.surfaceVariant }} />
               </>
             ) : (
               <TextInput
-                mode="outlined"
-                value={inputValue}
-                onChangeText={setInputValue}
+                mode="outlined" value={inputValue} onChangeText={setInputValue} autoFocus autoCapitalize="none"
                 placeholder={inputDialog ? INPUT_CONFIG[inputDialog.inputKey]?.placeholder : ''}
-                autoFocus
-                autoCapitalize="none"
-                multiline={inputDialog?.inputKey === 'text'}
-                numberOfLines={inputDialog?.inputKey === 'text' ? 4 : 1}
+                multiline={inputDialog?.inputKey === 'text'} numberOfLines={inputDialog?.inputKey === 'text' ? 4 : 1}
                 style={{ backgroundColor: theme.colors.surfaceVariant }}
               />
             )}
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={() => { setInputDialog(null); setInputValue(''); setInputPassword(''); }}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={handleInputConfirm}
-              disabled={!inputValue.trim()}
-            >
-              Send
-            </Button>
+            <Button mode="contained" onPress={handleInputConfirm} disabled={!inputValue.trim()}>Send</Button>
           </Dialog.Actions>
         </Dialog>
       </Portal>
