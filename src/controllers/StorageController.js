@@ -15,7 +15,7 @@ const DEFAULT_SETTINGS = {
   webApiPort: 11080,
   frameThrottleMs: 100,       // ms tra un frame e il prossimo (0 = max speed)
   featureMethod: 'webapi',
-  previewMethod: 'webapi'<
+  previewMethod: 'webapi'
 };
 
 async function getSettings() {

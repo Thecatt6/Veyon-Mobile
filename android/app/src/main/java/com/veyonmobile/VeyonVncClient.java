@@ -42,15 +42,12 @@ public class VeyonVncClient {
     private static final int ENC_HEXTILE = 5;
     private static final int ENC_ZLIB = 9;
     private static final int QMT_INT = 2;
-    private static final int QMT_MAP = 8;
-    private static final int QMT_STRING = 10;
-    private static final int QMT_UUID = 30;
     private static final int QMT_BYTEARRAY = 12;
     private static final int MSG_VEYON_FEATURE = 0x29;
     private static final long KEEPALIVE_MONITORING_PING_MS = 30000;
 
     private static final String[] SIGNATURE_ALGORITHMS = {
-            "SHA512withRSA", "SHA256withRSA", "SHA1withRSA", "NONEwithRSA"
+        "SHA512withRSA", "SHA256withRSA", "SHA1withRSA", "NONEwithRSA"
     };
 
     public static final String FEATURE_MONITORING_MODE   = "edad8259-b4ef-4ca5-90e6-f238d0fda694";
@@ -84,8 +81,6 @@ public class VeyonVncClient {
     private int fbWidth;
     private int fbHeight;
     private Bitmap framebuffer;
-    private int[] pixelBuffer; // Reusable buffer to reduce GC pressure
-    private byte[] rowBuffer;  // Row buffer for pixel reading
     private volatile String protocolStep = "init";
     private volatile String activeSignatureAlgorithm = SIGNATURE_ALGORITHMS[0];
     private volatile boolean cleanRemoteClose = false;
@@ -211,8 +206,6 @@ public class VeyonVncClient {
         Log.d(TAG, "ServerInit: " + fbWidth + "x" + fbHeight + " " + new String(nameBytes));
 
         framebuffer = Bitmap.createBitmap(fbWidth, fbHeight, Bitmap.Config.ARGB_8888);
-        pixelBuffer = new int[fbWidth * fbHeight]; // Allocate once to reduce GC
-        rowBuffer = new byte[fbWidth * 4]; // Max row size for pixel reading
         fullFrameReceived = false;
         callback.onConnected(fbWidth, fbHeight);
 
@@ -296,7 +289,7 @@ public class VeyonVncClient {
         int n = pbIn.read(peek);
         if (n < 4) { if (n > 0) pbIn.unread(peek, 0, n); return; }
         int msgSize = ((peek[0] & 0xFF) << 24) | ((peek[1] & 0xFF) << 16)
-                | ((peek[2] & 0xFF) << 8)  |  (peek[3] & 0xFF);
+                    | ((peek[2] & 0xFF) << 8)  |  (peek[3] & 0xFF);
         if (msgSize != 0) pbIn.unread(peek, 0, 4);
         else Log.d(TAG, "Post-auth ACK consumed");
     }
@@ -390,13 +383,13 @@ public class VeyonVncClient {
 
     private void sendSetEncodings() throws IOException {
         int[] encodings = {
-                ENC_HEXTILE,   // 5  - efficiente, supportato
-                ENC_ZLIB,      // 9  - compresso
-                ENC_RRE,       // 2
-                ENC_CORRE,     // 4
-                ENC_COPY_RECT, // 1
-                ENC_RAW,       // 0  - fallback
-                0xFFFFFF21,    // DesktopSize
+            ENC_HEXTILE,   // 5  - efficiente, supportato
+            ENC_ZLIB,      // 9  - compresso
+            ENC_RRE,       // 2
+            ENC_CORRE,     // 4
+            ENC_COPY_RECT, // 1
+            ENC_RAW,       // 0  - fallback
+            0xFFFFFF21,    // DesktopSize
         };
         out.writeByte(MSG_SET_ENCODINGS);
         out.writeByte(0);
@@ -419,7 +412,6 @@ public class VeyonVncClient {
     private void receiveLoop() throws IOException {
         long fpsTime = System.currentTimeMillis();
         long lastMonitoringPing = System.currentTimeMillis();
-        long lastFramebufferRequestMs = System.currentTimeMillis();
         // FIX #4 (FPS): timeout più lungo, no Log.d nel loop caldo
         socket.setSoTimeout(5000);
 
@@ -433,21 +425,14 @@ public class VeyonVncClient {
                         int numRects = in.readUnsignedShort();
                         if (numRects > 1000) throw new IOException("Invalid numRects: " + numRects);
                         for (int i = 0; i < numRects; i++) processRect();
+                        renderFrame();
                         fpsCount++;
-                        // Render after processing all rects
+                        // FIX #2 (schermo iniziale): dopo il primo full frame, passa a incrementale
                         if (!fullFrameReceived) {
                             fullFrameReceived = true;
-                            renderFrame();
                             Log.d(TAG, "Full frame received, switching to incremental");
-                        } else {
-                            renderFrame();
                         }
-                        // Send FBU request after rendering (throttled to ~30 FPS)
-                        long now = System.currentTimeMillis();
-                        if (now - lastFramebufferRequestMs >= 33) { // 33ms = ~30 FPS
-                            sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                            lastFramebufferRequestMs = now;
-                        }
+                        sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
                         break;
                     }
                     case MSG_SERVER_BELL:
@@ -474,14 +459,12 @@ public class VeyonVncClient {
                 }
 
             } catch (SocketTimeoutException timeout) {
-                // Keepalive - request new frame on timeout
+                // keepalive
                 sendFramebufferUpdateRequest(0, 0, fbWidth, fbHeight, true);
-                lastFramebufferRequestMs = System.currentTimeMillis();
             }
 
             if (Thread.interrupted()) break;
 
-            // Monitoring keepalive every 30 seconds
             long now = System.currentTimeMillis();
             if (now - lastMonitoringPing >= KEEPALIVE_MONITORING_PING_MS) {
                 try { sendFeatureMessage(FEATURE_MONITORING_MODE, true, null); } catch (IOException ignored) {}
@@ -529,21 +512,19 @@ public class VeyonVncClient {
     // FIX #1 (colori): con red-shift=0, i bytes arrivano [R, G, B, X]
     // quindi leggiamo byte0=R, byte1=G, byte2=B correttamente
     private void processRawRect(int x, int y, int w, int h) throws IOException {
-        // Optimized: read row by row to reduce memory allocation
-        synchronized (framebuffer) {
-            for (int row = 0; row < h; row++) {
-                in.readFully(rowBuffer, 0, w * 4);
-                for (int col = 0; col < w; col++) {
-                    int o = col * 4;
-                    pixelBuffer[col] = 0xFF000000
-                            | ((rowBuffer[o]   & 0xFF) << 16)  // R
-                            | ((rowBuffer[o+1] & 0xFF) << 8)   // G
-                            |  (rowBuffer[o+2] & 0xFF);         // B
-                }
-                framebuffer.setPixels(pixelBuffer, 0, w, x, y + row, w, 1);
-            }
+        int n = w * h;
+        byte[] data = new byte[n * 4];
+        in.readFully(data);
+        int[] pixels = new int[n];
+        for (int i = 0; i < n; i++) {
+            int o = i * 4;
+            pixels[i] = 0xFF000000
+                    | ((data[o]   & 0xFF) << 16)  // R
+                    | ((data[o+1] & 0xFF) << 8)   // G
+                    |  (data[o+2] & 0xFF);         // B
         }
-        framebufferDirty = true;
+        if (framebuffer != null)
+            synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
     }
 
     private void processCopyRect(int x, int y, int w, int h) throws IOException {
@@ -554,7 +535,6 @@ public class VeyonVncClient {
             framebuffer.getPixels(pixels, 0, w, srcX, srcY, w, h);
             framebuffer.setPixels(pixels, 0, w, x, y, w, h);
         }
-        framebufferDirty = true;
     }
 
     // Legge 4 bytes pixel (R,G,B,X) con red-shift=0
@@ -579,10 +559,8 @@ public class VeyonVncClient {
                 for (int col = sx; col < sx + sw && col < w; col++)
                     pixels[row * w + col] = fg;
         }
-        if (framebuffer != null) {
+        if (framebuffer != null)
             synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
-            framebufferDirty = true;
-        }
     }
 
     private void processCorreRect(int x, int y, int w, int h) throws IOException {
@@ -598,10 +576,8 @@ public class VeyonVncClient {
                 for (int col = sx; col < sx + sw && col < w; col++)
                     pixels[row * w + col] = fg;
         }
-        if (framebuffer != null) {
+        if (framebuffer != null)
             synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
-            framebufferDirty = true;
-        }
     }
 
     private void processHexTileRect(int x, int y, int w, int h) throws IOException {
@@ -649,10 +625,8 @@ public class VeyonVncClient {
                 }
             }
         }
-        if (framebuffer != null) {
+        if (framebuffer != null)
             synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
-            framebufferDirty = true;
-        }
     }
 
     private final Inflater zlibInflater = new Inflater();
@@ -671,31 +645,20 @@ public class VeyonVncClient {
                 total += r;
             }
         } catch (Exception e) { throw new IOException("ZLIB: " + e.getMessage()); }
-        // Optimized: use pixelBuffer and setPixels row by row
-        synchronized (framebuffer) {
-            for (int i = 0; i < h; i++) {
-                for (int j = 0; j < w; j++) {
-                    int idx = (i * w + j) * 4;
-                    pixelBuffer[j] = 0xFF000000
-                            | ((raw[idx]   & 0xFF) << 16)
-                            | ((raw[idx+1] & 0xFF) << 8)
-                            |  (raw[idx+2] & 0xFF);
-                }
-                framebuffer.setPixels(pixelBuffer, 0, w, x, y + i, w, 1);
-            }
-        }
-        framebufferDirty = true;
-        zlibInflater.reset(); // Reset after each rect for safety
+        int[] pixels = new int[w * h];
+        for (int i = 0; i < pixels.length; i++)
+            pixels[i] = 0xFF000000
+                    | ((raw[i*4]   & 0xFF) << 16)
+                    | ((raw[i*4+1] & 0xFF) << 8)
+                    |  (raw[i*4+2] & 0xFF);
+        if (framebuffer != null)
+            synchronized (framebuffer) { framebuffer.setPixels(pixels, 0, w, x, y, w, h); }
     }
 
-    private volatile boolean framebufferDirty = false;
-    
     // ─── Render ────────────────────────────────────────────────────────────────
 
     private void renderFrame() {
-        if (framebuffer == null || surfaceHolder == null || !framebufferDirty) return;
-        framebufferDirty = false; // Reset dirty flag
-        
+        if (framebuffer == null || surfaceHolder == null) return;
         Canvas canvas = null;
         try {
             canvas = surfaceHolder.lockCanvas();
@@ -729,17 +692,8 @@ public class VeyonVncClient {
             d.readInt(); d.readUnsignedByte();
             int cmd = d.readInt();
             Log.d(TAG, "FeatureMsg: " + uid + " cmd=" + cmd);
-            
-            // Respond to all feature queries to keep server happy
+            // Rispondi solo al MonitoringMode per mantenersi connesso
             if (FEATURE_MONITORING_MODE.equals(uid)) {
-                sendSimpleFeatureReply(uid, 0);
-            } else if (FEATURE_QUERY_ACTIVE.equals(uid)) {
-                sendSimpleFeatureReply(uid, 0);
-            } else if (FEATURE_USER_INFO.equals(uid)) {
-                sendSimpleFeatureReply(uid, 0);
-            } else if (FEATURE_SESSION_INFO.equals(uid)) {
-                sendSimpleFeatureReply(uid, 0);
-            } else if (FEATURE_QUERY_SCREENS.equals(uid)) {
                 sendSimpleFeatureReply(uid, 0);
             }
         } catch (Exception e) {
@@ -748,31 +702,23 @@ public class VeyonVncClient {
     }
 
     // FIX #3: sendFeatureMessage pubblico — chiamabile da VeyonVncModule
-    // Improved implementation using ByteArrayOutputStream for automatic sizing
     public synchronized void sendFeatureMessage(String featureUid, boolean active,
                                                 java.util.Map<String, String> arguments)
             throws IOException {
         if (out == null) return;
-        
-        // Build payload using ByteArrayOutputStream for automatic sizing
-        java.io.ByteArrayOutputStream payloadBAOS = new java.io.ByteArrayOutputStream();
-        java.io.DataOutputStream payloadOut = new java.io.DataOutputStream(payloadBAOS);
-        
-        // A. Write UUID (QVariant type 30)
-        writeQVariantUUID(payloadOut, featureUid);
-        
-        // B. Write command (QVariant Int): 0 = Start, 1 = Stop
-        writeQVariantInt(payloadOut, active ? 0 : 1);
-        
-        // C. Write arguments map (QVariant type 8)
-        writeQVariantMap(payloadOut, arguments);
-        
-        byte[] payload = payloadBAOS.toByteArray();
-        
-        // Send final packet: [MsgID (1b)] [PayloadLen (4b)] [Payload (Nb)]
-        out.writeByte(MSG_VEYON_FEATURE);
-        out.writeInt(payload.length);
-        out.write(payload);
+        byte[] uuidBytes = uuidToBytes(featureUid);
+        int payloadSize = 21 + 9 + 9; // UUID + Command + EmptyMap
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        buf.put((byte) MSG_VEYON_FEATURE);
+        buf.putInt(payloadSize);
+        // QVariant<QUuid> type=30
+        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
+        // QVariant<Int> command: 0=Start, 1=Stop, 2=Trigger
+        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(active ? 0 : 1);
+        // QVariant<Map> empty
+        buf.putInt(8); buf.put((byte) 0); buf.putInt(0);
+        out.write(buf.array());
         out.flush();
         Log.d(TAG, "sendFeatureMessage: " + featureUid + " active=" + active);
     }
@@ -781,58 +727,53 @@ public class VeyonVncClient {
     public synchronized void sendFeatureMessageWithArgs(String featureUid, boolean active,
                                                         java.util.Map<String, String> args)
             throws IOException {
-        // Just pass args to the main method
-        sendFeatureMessage(featureUid, active, args);
-    }
-    
-    // --- HELPER PER SERIALIZZAZIONE QVARIANT ---
-    
-    private void writeQVariantUUID(java.io.DataOutputStream out, String uid) throws IOException {
-        out.writeInt(QMT_UUID);
-        out.writeByte(0); // isNull = false
-        out.write(uuidToBytes(uid));
-    }
-    
-    private void writeQVariantInt(java.io.DataOutputStream out, int value) throws IOException {
-        out.writeInt(QMT_INT);
-        out.writeByte(0); // isNull = false
-        out.writeInt(value);
-    }
-    
-    private void writeQVariantMap(java.io.DataOutputStream out, java.util.Map<String, String> args) throws IOException {
-        out.writeInt(QMT_MAP);
-        out.writeByte(0); // isNull = false
-        
-        if (args == null || args.isEmpty()) {
-            out.writeInt(0); // Empty map
-        } else {
-            out.writeInt(args.size());
-            for (java.util.Map.Entry<String, String> entry : args.entrySet()) {
-                writeQString(out, entry.getKey());
-                writeQVariantString(out, entry.getValue());
+        if (out == null) return;
+        byte[] uuidBytes = uuidToBytes(featureUid);
+
+        // Calcola dimensione mappa argomenti
+        int mapDataSize = 4; // count
+        if (args != null) {
+            for (java.util.Map.Entry<String, String> e : args.entrySet()) {
+                byte[] k = e.getKey().getBytes("UTF-16BE");
+                byte[] v = e.getValue() != null ? e.getValue().getBytes("UTF-16BE") : new byte[0];
+                mapDataSize += (4+1+4+k.length) + (4+1+4+v.length);
             }
         }
-    }
-    
-    private void writeQVariantString(java.io.DataOutputStream out, String value) throws IOException {
-        out.writeInt(QMT_STRING);
-        out.writeByte(0);
-        writeQString(out, value);
-    }
-    
-    private void writeQString(java.io.DataOutputStream out, String s) throws IOException {
-        if (s == null) {
-            out.writeInt(0xFFFFFFFF); // Null string in Qt
-            return;
+
+        int payloadSize = 21 + 9 + (4 + 1 + mapDataSize);
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        buf.put((byte) MSG_VEYON_FEATURE);
+        buf.putInt(payloadSize);
+        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
+        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(0); // 0=Default/Trigger per features con args
+        buf.putInt(8); buf.put((byte) 0);
+        buf.putInt(args != null ? args.size() : 0);
+        if (args != null) {
+            for (java.util.Map.Entry<String, String> e : args.entrySet()) {
+                byte[] k = e.getKey().getBytes("UTF-16BE");
+                byte[] v = e.getValue() != null ? e.getValue().getBytes("UTF-16BE") : new byte[0];
+                buf.putInt(10); buf.put((byte) 0); buf.putInt(k.length); buf.put(k);
+                buf.putInt(10); buf.put((byte) 0); buf.putInt(v.length); buf.put(v);
+            }
         }
-        byte[] bytes = s.getBytes("UTF-16BE");
-        out.writeInt(bytes.length); // Length in bytes
-        out.write(bytes);
+        out.write(buf.array());
+        out.flush();
     }
 
     private void sendSimpleFeatureReply(String featureUid, int command) throws IOException {
         if (out == null) return;
-        sendFeatureMessage(featureUid, command == 0, null);
+        byte[] uuidBytes = uuidToBytes(featureUid);
+        int payloadSize = 21 + 9 + 9;
+        out.writeByte(MSG_VEYON_FEATURE);
+        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        buf.putInt(payloadSize);
+        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
+        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(command);
+        buf.putInt(8); buf.put((byte) 0); buf.putInt(0);
+        out.write(buf.array());
+        out.flush();
     }
 
     private byte[] uuidToBytes(String uid) {
@@ -873,5 +814,122 @@ public class VeyonVncClient {
 
     private void closeSocketQuietly() {
         try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+    }
+
+    /**
+     * Connessione VNC headless (senza SurfaceHolder) solo per mandare una feature.
+     * Usato dal broadcast della HomeScreen.
+     */
+    public static void sendFeatureDirect(String host, int port, String keyName,
+                                          String privateKeyPem, String featureUid,
+                                          boolean active, java.util.Map<String, String> args)
+            throws Exception {
+        Socket s = new Socket();
+        s.connect(new InetSocketAddress(host, port), 5000);
+        s.setTcpNoDelay(true);
+        s.setSoTimeout(8000);
+        DataInputStream din = new DataInputStream(new PushbackInputStream(s.getInputStream(), 16));
+        DataOutputStream dout = new DataOutputStream(s.getOutputStream());
+
+        try {
+            // Handshake
+            byte[] ver = new byte[12];
+            din.readFully(ver);
+            dout.write("RFB 003.008\n".getBytes());
+            dout.flush();
+
+            // Security
+            int n = din.readUnsignedByte();
+            if (n == 0) throw new IOException("Server error");
+            int veyon = -1;
+            for (int i = 0; i < n; i++) {
+                int t = din.readUnsignedByte();
+                if (t == 40) veyon = t;
+            }
+            if (veyon == -1) throw new IOException("No Veyon security");
+            dout.writeByte(40); dout.flush();
+
+            // Auth types
+            int msgSize = din.readInt();
+            byte[] buf = new byte[msgSize];
+            din.readFully(buf);
+
+            // Send authType + username
+            byte[] uBytes = "veyon-mobile".getBytes("UTF-16BE");
+            int pSize = 9 + (4 + 1 + 4 + uBytes.length);
+            dout.writeInt(pSize);
+            dout.writeInt(2); dout.writeByte(0); dout.writeInt(3);
+            dout.writeInt(10); dout.writeByte(0); dout.writeInt(uBytes.length); dout.write(uBytes);
+            dout.flush();
+
+            // ACK opzionale
+            int first = din.readInt();
+            int challengeSize = (first == 0) ? din.readInt() : first;
+            byte[] payload = new byte[challengeSize];
+            din.readFully(payload);
+
+            // Parse challenge
+            java.io.DataInputStream pd = new java.io.DataInputStream(new java.io.ByteArrayInputStream(payload));
+            pd.readInt(); pd.readUnsignedByte();
+            int len = pd.readInt();
+            byte[] challenge = new byte[len];
+            pd.readFully(challenge);
+
+            // Sign
+            String pem = privateKeyPem
+                    .replace("-----BEGIN PRIVATE KEY-----", "")
+                    .replace("-----END PRIVATE KEY-----", "")
+                    .replaceAll("\\s+", "");
+            byte[] keyBytes = Base64.decode(pem, Base64.DEFAULT);
+            PrivateKey pk = KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
+            Signature sig = Signature.getInstance("SHA512withRSA");
+            sig.initSign(pk);
+            sig.update(challenge);
+            byte[] signature = sig.sign();
+
+            // Send keyName + signature
+            byte[] kBytes = keyName.getBytes("UTF-16BE");
+            int sz = (4+1+4+kBytes.length) + (4+1+4+signature.length);
+            dout.writeInt(sz);
+            dout.writeInt(10); dout.writeByte(0); dout.writeInt(kBytes.length); dout.write(kBytes);
+            dout.writeInt(12); dout.writeByte(0); dout.writeInt(signature.length); dout.write(signature);
+            dout.flush();
+
+            // Security result
+            int result = din.readInt();
+            if (result != 0) throw new IOException("Auth failed");
+
+            // ClientInit
+            dout.writeByte(1); dout.flush();
+
+            // ServerInit — leggi e scarta
+            din.readUnsignedShort(); din.readUnsignedShort(); // w, h
+            din.readFully(new byte[16]); // pixel format
+            int nameLen = din.readInt();
+            din.readFully(new byte[nameLen]);
+
+            // SetPixelFormat + SetEncodings + MonitoringMode
+            dout.writeByte(0); dout.writeByte(0); dout.writeByte(0); dout.writeByte(0);
+            dout.writeByte(32); dout.writeByte(24); dout.writeByte(0); dout.writeByte(1);
+            dout.writeShort(255); dout.writeShort(255); dout.writeShort(255);
+            dout.writeByte(0); dout.writeByte(8); dout.writeByte(16);
+            dout.writeByte(0); dout.writeByte(0); dout.writeByte(0);
+            dout.flush();
+
+            // Manda la feature
+            VeyonVncClient tmp = new VeyonVncClient(host, port, keyName, privateKeyPem, null, null);
+            tmp.out = dout;
+            if (args != null && !args.isEmpty()) {
+                tmp.sendFeatureMessageWithArgs(featureUid, active, args);
+            } else {
+                tmp.sendFeatureMessage(featureUid, active, null);
+            }
+
+            // Aspetta un momento per assicurarsi che il server riceva
+            Thread.sleep(300);
+
+        } finally {
+            try { s.close(); } catch (Exception ignored) {}
+        }
     }
 }

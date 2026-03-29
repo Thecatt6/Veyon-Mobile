@@ -281,6 +281,23 @@ const ComputerDetailScreen = ({ route, navigation }) => {
   }, []);
 
   // ── Esegui feature ───────────────────────────────────────────────────────────
+  // Converte args con chiavi JS (text, url, executable...) in chiavi numeriche Veyon ("0", "1"...)
+  // Veyon usa QVariantMap con chiavi stringa degli indici: {"0": valore, "1": valore2}
+  const toVncArgs = (args) => {
+    const map = {
+      text:       { '0': args.text },
+      url:        { '0': args.url },
+      executable: { '0': args.executable },
+      username:   { '0': args.username, '1': args.password || '' },
+    };
+    // Trova la prima chiave riconosciuta
+    for (const [key, mapped] of Object.entries(map)) {
+      if (args[key] !== undefined) return mapped;
+    }
+    // Fallback: converti le chiavi in indici numerici
+    return Object.fromEntries(Object.values(args).map((v, i) => [String(i), String(v)]));
+  };
+
   const executeFeature = useCallback(async (feature, args = {}) => {
     const meta = getMeta(feature);
     const newActive = meta.toggle ? !feature.active : true;
@@ -294,17 +311,13 @@ const ComputerDetailScreen = ({ route, navigation }) => {
       const method = featureMethod || connectionMethod;
 
       if (method === 'vnc') {
-        // Usa VNC per eseguire la feature
-        // Ottieni UID della feature: usa quello che abbiamo o cerca nella mappa
         const uid = feature.uid || FEATURE_UIDS[feature.name];
         if (!uid) throw new Error(`Unknown feature UID for: ${feature.name}`);
-
-        // Converti args in formato corretto
-        const argsMap = Object.keys(args).length > 0 ? args : {};
-        await VeyonVncModule.sendFeature(uid, newActive, argsMap);
+        // Converti args in formato Veyon (chiavi numeriche)
+        const vncArgs = Object.keys(args).length > 0 ? toVncArgs(args) : {};
+        await VeyonVncModule.sendFeature(uid, newActive, vncArgs);
 
       } else {
-        // Usa WebAPI
         if (!sessionRef.current) throw new Error('No WebAPI session');
         await setFeature(baseURL, sessionRef.current.connectionUid, feature.uid, newActive, args);
         await loadFeatures(sessionRef.current.connectionUid, 1);

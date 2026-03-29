@@ -92,4 +92,27 @@ public class VeyonVncModule extends ReactContextBaseJavaModule {
                     .emit(eventName, data);
         } catch (Exception ignored) {}
     }
+
+        @ReactMethod
+    public void sendFeatureDirect(String host, int port, String keyName,
+                                   String privateKey, String featureUid,
+                                   boolean active, ReadableMap args, Promise promise) {
+        new Thread(() -> {
+            try {
+                Map<String, String> argsMap = new HashMap<>();
+                if (args != null) {
+                    ReadableMapKeySetIterator it = args.keySetIterator();
+                    while (it.hasNextKey()) {
+                        String key = it.nextKey();
+                        argsMap.put(key, args.getString(key));
+                    }
+                }
+                VeyonVncClient.sendFeatureDirect(host, port, keyName, privateKey, featureUid, active, argsMap);
+                promise.resolve(null);
+            } catch (Exception e) {
+                promise.reject("FEATURE_DIRECT_ERROR", e.getMessage());
+            }
+        }, "VeyonFeatureDirect").start();
+    }
+ 
 }
