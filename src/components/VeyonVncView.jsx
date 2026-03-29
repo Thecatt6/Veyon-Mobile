@@ -27,6 +27,7 @@ const VeyonVncView = ({
   const [status, setStatus] = useState('connecting');
   const [fps, setFps] = useState(0);
   const [resolution, setResolution] = useState('');
+  const [serverName, setServerName] = useState('');
   const surfaceReady = useRef(false);
   const connected = useRef(false);
   const onConnectedRef = useRef(onConnected);
@@ -37,13 +38,14 @@ const VeyonVncView = ({
   useEffect(() => { onDisconnectedRef.current = onDisconnected; }, [onDisconnected]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
-  // Expose sendFeature method for parent components
+  // Expose sendFeature method and serverName for parent components
   useEffect(() => {
     VeyonVncView.sendFeature = async (featureUid, active, args = null) => {
       if (!VeyonVncModule) throw new Error('VeyonVncModule not available');
       return await VeyonVncModule.sendFeature(featureUid, active, args);
     };
-  }, []);
+    VeyonVncView.getServerName = () => serverName;
+  }, [serverName]);
 
   const doConnect = useCallback(() => {
     if (!surfaceReady.current || !host || !keyName || !privateKey) {
@@ -56,9 +58,13 @@ const VeyonVncView = ({
     setStatus('connecting');
     VeyonVncModule.connect(host, port, keyName, privateKey)
       .then((res) => {
-        setResolution(res);
+        // Parse resolution and server name from "WxH|ServerName"
+        const [resPart, namePart] = res.split('|');
+        setResolution(resPart);
+        if (namePart) setServerName(namePart);
         setStatus('live');
-        onConnectedRef.current?.();
+        // Call onConnected AFTER setting serverName so parent can access it
+        setTimeout(() => onConnectedRef.current?.(), 50);
       })
       .catch((err) => {
         connected.current = false;

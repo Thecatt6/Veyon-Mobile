@@ -39,8 +39,8 @@ public class VeyonVncModule extends ReactContextBaseJavaModule {
         }
         SurfaceHolder holder = activeSurface.getHolder();
         VeyonVncClient.Callback cb = new VeyonVncClient.Callback() {
-            @Override public void onConnected(int w, int h) {
-                sendEvent("veyonVncConnected", w + "x" + h);
+            @Override public void onConnected(int w, int h, String serverName) {
+                sendEvent("veyonVncConnected", w + "x" + h + "|" + serverName);
                 promise.resolve(w + "x" + h);
             }
             @Override public void onDisconnected(String reason) { sendEvent("veyonVncDisconnected", reason); }

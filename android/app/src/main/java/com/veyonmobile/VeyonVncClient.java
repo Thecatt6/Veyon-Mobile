@@ -89,7 +89,7 @@ public class VeyonVncClient {
     private volatile boolean fullFrameReceived = false;
 
     public interface Callback {
-        void onConnected(int width, int height);
+        void onConnected(int width, int height, String serverName);
         void onDisconnected(String reason);
         void onError(String error);
         void onFpsUpdate(int fps);
@@ -203,11 +203,12 @@ public class VeyonVncClient {
         int nameLen = in.readInt();
         byte[] nameBytes = new byte[nameLen];
         in.readFully(nameBytes);
-        Log.d(TAG, "ServerInit: " + fbWidth + "x" + fbHeight + " " + new String(nameBytes));
+        String serverName = new String(nameBytes);
+        Log.d(TAG, "ServerInit: " + fbWidth + "x" + fbHeight + " " + serverName);
 
         framebuffer = Bitmap.createBitmap(fbWidth, fbHeight, Bitmap.Config.ARGB_8888);
         fullFrameReceived = false;
-        callback.onConnected(fbWidth, fbHeight);
+        callback.onConnected(fbWidth, fbHeight, serverName);
 
         // FIX #2: pixel format — little-endian, red shift=0 means server sends [B,G,R,X]
         // We read byte0=B, byte1=G, byte2=R → fix in processRawRect: swap R and B
@@ -692,13 +693,108 @@ public class VeyonVncClient {
             d.readInt(); d.readUnsignedByte();
             int cmd = d.readInt();
             Log.d(TAG, "FeatureMsg: " + uid + " cmd=" + cmd);
-            // Rispondi solo al MonitoringMode per mantenersi connesso
+            
+            // Respond to ALL feature queries to keep server happy
             if (FEATURE_MONITORING_MODE.equals(uid)) {
                 sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_QUERY_APP_VERSION.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_QUERY_ACTIVE.equals(uid)) {
+                sendSimpleFeatureReply(uid, 0);
+            } else if (FEATURE_USER_INFO.equals(uid)) {
+                sendFeatureReplyWithMap(uid, 0,
+                    "userLoginName", "veyon-user",
+                    "userFullName", "Veyon User");
+            } else if (FEATURE_SESSION_INFO.equals(uid)) {
+                sendFeatureReplyWithMap(uid, 0,
+                    "sessionClientName", "veyon-mobile");
+            } else if (FEATURE_QUERY_SCREENS.equals(uid)) {
+                sendFeatureReplyWithList(uid, 0, "screens",
+                    "{\"name\":\"Screen 1\",\"width\":1920,\"height\":1080}");
             }
         } catch (Exception e) {
             Log.w(TAG, "handleFeatureMessage: " + e.getMessage());
         }
+    }
+
+    private void sendSimpleFeatureReply(String featureUid, int command) throws IOException {
+        if (out == null) return;
+        byte[] uuidBytes = uuidToBytes(featureUid);
+        int payloadSize = 21 + 9 + 9;
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        buf.put((byte) MSG_VEYON_FEATURE);
+        buf.putInt(payloadSize);
+        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
+        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(command);
+        buf.putInt(8); buf.put((byte) 0); buf.putInt(0);
+        out.write(buf.array());
+        out.flush();
+    }
+
+    private void sendFeatureReplyWithMap(String featureUid, int command, Object... args) throws IOException {
+        if (out == null || args.length % 2 != 0) return;
+        byte[] uuidBytes = uuidToBytes(featureUid);
+        
+        java.util.Map<String, String> map = new java.util.HashMap<>();
+        for (int i = 0; i < args.length; i += 2) {
+            map.put((String)args[i], (String)args[i+1]);
+        }
+        
+        int mapDataSize = 4; // count
+        for (java.util.Map.Entry<String, String> e : map.entrySet()) {
+            byte[] k = e.getKey().getBytes("UTF-16BE");
+            byte[] v = e.getValue().getBytes("UTF-16BE");
+            mapDataSize += (4+1+4+k.length) + (4+1+4+v.length);
+        }
+        
+        int payloadSize = 21 + 9 + (4 + 1 + mapDataSize);
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        buf.put((byte) MSG_VEYON_FEATURE);
+        buf.putInt(payloadSize);
+        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
+        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(command);
+        buf.putInt(8); buf.put((byte) 0); buf.putInt(map.size());
+        for (java.util.Map.Entry<String, String> e : map.entrySet()) {
+            byte[] k = e.getKey().getBytes("UTF-16BE");
+            byte[] v = e.getValue().getBytes("UTF-16BE");
+            buf.putInt(10); buf.put((byte) 0); buf.putInt(k.length); buf.put(k);
+            buf.putInt(10); buf.put((byte) 0); buf.putInt(v.length); buf.put(v);
+        }
+        out.write(buf.array());
+        out.flush();
+    }
+
+    private void sendFeatureReplyWithList(String featureUid, int command, String listKey, String... items) throws IOException {
+        if (out == null) return;
+        byte[] uuidBytes = uuidToBytes(featureUid);
+        
+        int listDataSize = 0;
+        for (String item : items) {
+            byte[] v = item.getBytes("UTF-16BE");
+            listDataSize += (4+1+4+v.length);
+        }
+        
+        int mapDataSize = 4 + (4+1+4+listKey.getBytes("UTF-16BE").length) + (4+1+4+listDataSize);
+        int payloadSize = 21 + 9 + mapDataSize;
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + payloadSize);
+        buf.order(ByteOrder.BIG_ENDIAN);
+        buf.put((byte) MSG_VEYON_FEATURE);
+        buf.putInt(payloadSize);
+        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
+        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(command);
+        buf.putInt(8); buf.put((byte) 0); buf.putInt(1);
+        
+        byte[] k = listKey.getBytes("UTF-16BE");
+        buf.putInt(10); buf.put((byte) 0); buf.putInt(k.length); buf.put(k);
+        buf.putInt(10); buf.put((byte) 0); buf.putInt(items.length * 20);
+        for (String item : items) {
+            byte[] v = item.getBytes("UTF-16BE");
+            buf.putInt(10); buf.put((byte) 0); buf.putInt(v.length); buf.put(v);
+        }
+        out.write(buf.array());
+        out.flush();
     }
 
     // FIX #3: sendFeatureMessage pubblico — chiamabile da VeyonVncModule
@@ -757,21 +853,6 @@ public class VeyonVncClient {
                 buf.putInt(10); buf.put((byte) 0); buf.putInt(v.length); buf.put(v);
             }
         }
-        out.write(buf.array());
-        out.flush();
-    }
-
-    private void sendSimpleFeatureReply(String featureUid, int command) throws IOException {
-        if (out == null) return;
-        byte[] uuidBytes = uuidToBytes(featureUid);
-        int payloadSize = 21 + 9 + 9;
-        out.writeByte(MSG_VEYON_FEATURE);
-        ByteBuffer buf = ByteBuffer.allocate(4 + payloadSize);
-        buf.order(ByteOrder.BIG_ENDIAN);
-        buf.putInt(payloadSize);
-        buf.putInt(30); buf.put((byte) 0); buf.put(uuidBytes);
-        buf.putInt(QMT_INT); buf.put((byte) 0); buf.putInt(command);
-        buf.putInt(8); buf.put((byte) 0); buf.putInt(0);
         out.write(buf.array());
         out.flush();
     }

@@ -259,7 +259,11 @@ const ComputerDetailScreen = ({ route, navigation }) => {
         try {
           const user = await getSessionUser(baseURL, session.connectionUid);
           if (mountedRef.current) setUserLabel(user || '');
-        } catch { }
+        } catch { 
+          // WebAPI not available - get server name from VNC
+          const vncName = VeyonVncView.getServerName?.();
+          if (mountedRef.current && vncName) setUserLabel(vncName);
+        }
         startStream(session.connectionUid, r, q, c);
         if (mountedRef.current) setStatus('live');
         setTimeout(() => loadFeatures(session.connectionUid), 800);
@@ -391,7 +395,26 @@ const ComputerDetailScreen = ({ route, navigation }) => {
           keyName={vncAuthKey.keyName}
           privateKey={vncAuthKey.privateKey}
           style={{ width: W, height: frameHeight }}
-          onConnected={() => { if (mountedRef.current) setStatus('live'); }}
+          onConnected={() => {
+            if (mountedRef.current) {
+              setStatus('live');
+              // Get server name from VNC (contains computer/user info)
+              const serverName = VeyonVncView.getServerName?.();
+              console.log('VNC Connected - Server name:', serverName);
+              if (serverName) {
+                // Parse user from server name like "pc ( 192.168.42.165 ) - service mode"
+                const match = serverName.match(/^([^(]+)\s*\(/);
+                if (match) {
+                  const computerName = match[1].trim();
+                  console.log('Setting userLabel to:', computerName);
+                  setUserLabel(computerName || serverName);
+                } else {
+                  console.log('Setting userLabel to:', serverName);
+                  setUserLabel(serverName);
+                }
+              }
+            }
+          }}
           onFpsUpdate={(f) => { if (mountedRef.current) setFps(f); }}
           onError={(e) => console.warn('VNC error:', e)}
         />

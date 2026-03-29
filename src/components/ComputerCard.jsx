@@ -6,6 +6,7 @@ import { startFramePoller } from '../controllers/MJPEGStream';
 import { extraColors } from '../theme';
 import { getAuthKeys, getSettings } from '../controllers/StorageController';
 import { NativeModules } from 'react-native';
+import VeyonVncView from './VeyonVncView';
 
 const { NetworkProbeModule } = NativeModules;
 
@@ -84,7 +85,14 @@ const ComputerCard = ({ computer, onPress, onLongPress }) => {
               }, 1500);
               break;
             } catch {
-              // WebAPI non disponibile — ok, mostriamo solo il computer label
+              // WebAPI non disponibile — usa il server name da VNC
+              const vncName = VeyonVncView.getServerName?.();
+              if (mountedRef.current && vncName) {
+                // Parse computer name from "pc ( 192.168.42.165 ) - service mode"
+                const match = vncName.match(/^([^(]+)\s*\(/);
+                const displayName = match ? match[1].trim() : vncName;
+                setUserLabel(displayName);
+              }
             }
           }
         }
@@ -146,6 +154,7 @@ const ComputerCard = ({ computer, onPress, onLongPress }) => {
     if (status === 'error') return 'Unreachable';
     if (status === 'no-auth') return 'No Auth Key';
     if (userLabel) return userLabel;
+    // In live mode without userLabel, show computer label or IP
     return computer.label || computer.ip;
   })();
 
