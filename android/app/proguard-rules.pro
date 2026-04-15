@@ -8,3 +8,11 @@
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
 # Add any project specific keep options here:
+
+# Veyon Mobile - preserva tutti i moduli nativi
+-keep class com.veyonmobile.** { *; }
+-keepclassmembers class com.veyonmobile.** { *; }
+
+# React Native bridge
+-keep class com.facebook.react.** { *; }
+-keepclassmembers class com.facebook.react.** { *; }
